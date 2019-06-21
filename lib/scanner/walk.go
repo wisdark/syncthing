@@ -357,7 +357,9 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 			// conflict.
 			f.Version = f.Version.DropOthers(w.ShortID)
 		}
-		l.Debugln("rescan:", curFile, info.ModTime().Unix(), info.Mode()&fs.ModePerm)
+		curFileCopy := curFile
+		curFileCopy.Blocks = nil
+		l.Debugln("rescan:", curFileCopy, info.ModTime(), info.Mode()&fs.ModePerm)
 	}
 
 	l.Debugln("to hash:", relPath, f)

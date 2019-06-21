@@ -7,6 +7,9 @@
 package fs
 
 import (
+	"bufio"
+	"bytes"
+	"runtime/debug"
 	"time"
 )
 
@@ -59,6 +62,7 @@ func (f *MtimeFS) Chtimes(name string, atime, mtime time.Time) error {
 	// because it might be "does not exist" or similar.
 	info, err := f.Filesystem.Lstat(name)
 	if err != nil {
+		l.Debugln("Chtimes: Lstat:", err)
 		return err
 	}
 
@@ -72,43 +76,36 @@ func (f *MtimeFS) Stat(name string) (FileInfo, error) {
 		return nil, err
 	}
 
-	real, virtual := f.load(name)
-	if real == info.ModTime() {
-		info = mtimeFileInfo{
-			FileInfo: info,
-			mtime:    virtual,
-		}
-	}
+	mtime := f.load(name, info.ModTime())
 
-	return info, nil
+	return mtimeFileInfo{
+		FileInfo: info,
+		mtime:    mtime,
+	}, nil
 }
 
 func (f *MtimeFS) Lstat(name string) (FileInfo, error) {
 	info, err := f.Filesystem.Lstat(name)
 	if err != nil {
+		l.Debugln("Lstat:", err)
 		return nil, err
 	}
 
-	real, virtual := f.load(name)
-	if real == info.ModTime() {
-		info = mtimeFileInfo{
-			FileInfo: info,
-			mtime:    virtual,
-		}
-	}
+	mtime := f.load(name, info.ModTime())
 
-	return info, nil
+	return mtimeFileInfo{
+		FileInfo: info,
+		mtime:    mtime,
+	}, nil
 }
 
 func (f *MtimeFS) Walk(root string, walkFn WalkFunc) error {
 	return f.Filesystem.Walk(root, func(path string, info FileInfo, err error) error {
 		if info != nil {
-			real, virtual := f.load(path)
-			if real == info.ModTime() {
-				info = mtimeFileInfo{
-					FileInfo: info,
-					mtime:    virtual,
-				}
+			mtime := f.load(path, info.ModTime())
+			info = mtimeFileInfo{
+				FileInfo: info,
+				mtime:    mtime,
 			}
 		}
 		return walkFn(path, info, err)
@@ -150,6 +147,7 @@ func (f *MtimeFS) save(name string, real, virtual time.Time) {
 	if real.Equal(virtual) {
 		// If the virtual time and the real on disk time are equal we don't
 		// need to store anything.
+		l.Debugf("save: clearing saved for %s, time is %v", name, real)
 		f.db.Delete(name)
 		return
 	}
@@ -159,25 +157,37 @@ func (f *MtimeFS) save(name string, real, virtual time.Time) {
 		virtual: virtual,
 	}
 	bs, _ := mtime.Marshal() // Can't fail
+	l.Debugf("save: saving %v / %v for %s", real, virtual, name)
 	f.db.PutBytes(name, bs)
 }
 
-func (f *MtimeFS) load(name string) (real, virtual time.Time) {
+func (f *MtimeFS) load(name string, real time.Time) time.Time {
 	if f.caseInsensitive {
 		name = UnicodeLowercase(name)
 	}
 
 	data, exists := f.db.Bytes(name)
 	if !exists {
-		return
+		l.Debugln("load: nothing for", name)
+		return real
 	}
 
 	var mtime dbMtime
 	if err := mtime.Unmarshal(data); err != nil {
-		return
+		l.Debugln("load: unmarshal error for", name)
+		return real
 	}
 
-	return mtime.real, mtime.virtual
+	scanner := bufio.NewScanner(bytes.NewReader(debug.Stack()))
+	l.Debugf("load: loaded %v / %v for %s (%t %t)", mtime.real, mtime.virtual, name, mtime.real == real, mtime.real.Equal(real))
+	for scanner.Scan() {
+		l.Debugln(name, scanner.Text())
+	}
+
+	if mtime.real.Equal(real) {
+		return mtime.virtual
+	}
+	return real
 }
 
 // The mtimeFileInfo is an os.FileInfo that lies about the ModTime().
@@ -202,15 +212,11 @@ func (f *mtimeFile) Stat() (FileInfo, error) {
 		return nil, err
 	}
 
-	real, virtual := f.fs.load(f.Name())
-	if real == info.ModTime() {
-		info = mtimeFileInfo{
-			FileInfo: info,
-			mtime:    virtual,
-		}
-	}
-
-	return info, nil
+	mtime := f.fs.load(f.Name(), info.ModTime())
+	return mtimeFileInfo{
+		FileInfo: info,
+		mtime:    mtime,
+	}, nil
 }
 
 // The dbMtime is our database representation
