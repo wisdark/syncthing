@@ -179,7 +179,7 @@ func (f *MtimeFS) load(name string, real time.Time) time.Time {
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(debug.Stack()))
-	l.Debugf("load: loaded %v / %v for %s (%t %t)", mtime.real, mtime.virtual, name, mtime.real == real, mtime.real.Equal(real))
+	l.Debugf("load: loaded %v / %v (%v) for %s (%t %t)", mtime.real, mtime.virtual, real, name, mtime.real == real, mtime.real.Equal(real))
 	for scanner.Scan() {
 		l.Debugln(name, scanner.Text())
 	}
