@@ -18,6 +18,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const chunk = 1500
+
 // limiter manages a read and write rate limit, reacting to config changes
 // as appropriate.
 type limiter struct {
@@ -244,10 +246,24 @@ type limitedWriter struct {
 }
 
 func (w *limitedWriter) Write(buf []byte) (int, error) {
-	if !w.isLAN || w.limitsLAN.get() {
-		take(w.waiter, len(buf))
+	if w.isLAN && !w.limitsLAN.get() {
+		return w.writer.Write(buf)
 	}
-	return w.writer.Write(buf)
+
+	written := 0
+	for written < len(buf) {
+		toWrite := len(buf) - written
+		if toWrite > chunk {
+			toWrite = chunk
+		}
+		take(w.waiter, toWrite)
+		n, err := w.writer.Write(buf[written : written+toWrite])
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 // take is a utility function to consume tokens from a overall rate.Limiter and deviceLimiter.
