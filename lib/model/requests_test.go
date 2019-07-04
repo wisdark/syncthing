@@ -201,7 +201,7 @@ func TestRequestCreateTmpSymlink(t *testing.T) {
 
 	select {
 	case <-goodIdx:
-	case <-time.After(3 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("Timed out without index entry being sent")
 	}
 }
@@ -356,7 +356,7 @@ func pullInvalidIgnored(t *testing.T, ft config.FolderType) {
 	select {
 	case ev := <-sub.C():
 		t.Fatalf("Errors while scanning/pulling: %v", ev)
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("timed out before index was received")
 	case <-done:
 	}
@@ -409,7 +409,7 @@ func pullInvalidIgnored(t *testing.T, ft config.FolderType) {
 	}
 
 	select {
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("timed out before index was received")
 	case <-done:
 	}
@@ -509,7 +509,7 @@ func TestRescanIfHaveInvalidContent(t *testing.T) {
 		if f.Blocks[0].WeakHash != 41943361 {
 			t.Fatalf("unexpected weak hash: %d != 41943361", f.Blocks[0].WeakHash)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out")
 	}
 }
@@ -538,7 +538,7 @@ func TestParentDeletion(t *testing.T) {
 		if len(fs) != 2 {
 			t.Fatalf("Sent index with %d files, should be 2", len(fs))
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out")
 	}
 
@@ -558,7 +558,7 @@ func TestParentDeletion(t *testing.T) {
 		if fs[0].Name != child {
 			t.Fatalf(`Sent index with file "%v", should be "%v"`, fs[0].Name, child)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out")
 	}
 
@@ -582,7 +582,7 @@ func TestParentDeletion(t *testing.T) {
 		if !found {
 			t.Fatalf(`File "%v" is missing in index`, child)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("timed out")
 	}
 }
@@ -625,7 +625,7 @@ func TestRequestSymlinkWindows(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out before pull was finished")
 	}
 
@@ -694,7 +694,7 @@ func TestRequestRemoteRenameChanged(t *testing.T) {
 	fc.sendIndexUpdate()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
@@ -763,7 +763,7 @@ func TestRequestRemoteRenameChanged(t *testing.T) {
 	fc.sendIndexUpdate()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Errorf("timed out without receiving all expected index updates")
 	}
 
@@ -817,7 +817,7 @@ func TestRequestRemoteRenameConflict(t *testing.T) {
 		if i != 2 {
 			t.Fatalf("received %v items in index, expected 1", i)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
@@ -840,7 +840,7 @@ func TestRequestRemoteRenameConflict(t *testing.T) {
 		if i != 1 {
 			t.Fatalf("received %v items in index, expected 1", i)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
@@ -853,7 +853,7 @@ func TestRequestRemoteRenameConflict(t *testing.T) {
 	fc.sendIndexUpdate()
 	select {
 	case <-recv:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
@@ -904,7 +904,7 @@ func TestRequestDeleteChanged(t *testing.T) {
 	select {
 	case <-done:
 		done = make(chan struct{})
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
@@ -934,7 +934,7 @@ func TestRequestDeleteChanged(t *testing.T) {
 	fc.sendIndexUpdate()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out")
 	}
 
