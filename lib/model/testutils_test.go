@@ -9,6 +9,7 @@ package model
 import (
 	"io/ioutil"
 	"os"
+	"testing"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
@@ -17,6 +18,7 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
 )
 
 var (
@@ -80,6 +82,13 @@ func testFolderConfigTmp() config.FolderConfiguration {
 
 func testFolderConfig(path string) config.FolderConfiguration {
 	cfg := config.NewFolderConfiguration(myID, "default", "default", fs.FilesystemTypeBasic, path)
+	cfg.FSWatcherEnabled = false
+	cfg.Devices = append(cfg.Devices, config.FolderDeviceConfiguration{DeviceID: device1})
+	return cfg
+}
+
+func testFolderConfigFake() config.FolderConfiguration {
+	cfg := config.NewFolderConfiguration(myID, "default", "default", fs.FilesystemTypeFake, rand.String(32)+"?content=true")
 	cfg.FSWatcherEnabled = false
 	cfg.Devices = append(cfg.Devices, config.FolderDeviceConfiguration{DeviceID: device1})
 	return cfg
@@ -170,4 +179,41 @@ func (c *alwaysChanged) Seen(fs fs.Filesystem, name string) bool {
 
 func (c *alwaysChanged) Changed() bool {
 	return true
+}
+
+func localSize(t *testing.T, m Model, folder string) db.Counts {
+	t.Helper()
+	snap := dbSnapshot(t, m, folder)
+	defer snap.Release()
+	return snap.LocalSize()
+}
+
+func globalSize(t *testing.T, m Model, folder string) db.Counts {
+	t.Helper()
+	snap := dbSnapshot(t, m, folder)
+	defer snap.Release()
+	return snap.GlobalSize()
+}
+
+func receiveOnlyChangedSize(t *testing.T, m Model, folder string) db.Counts {
+	t.Helper()
+	snap := dbSnapshot(t, m, folder)
+	defer snap.Release()
+	return snap.ReceiveOnlyChangedSize()
+}
+
+func needSize(t *testing.T, m Model, folder string) db.Counts {
+	t.Helper()
+	snap := dbSnapshot(t, m, folder)
+	defer snap.Release()
+	return snap.NeedSize()
+}
+
+func dbSnapshot(t *testing.T, m Model, folder string) *db.Snapshot {
+	t.Helper()
+	snap, err := m.DBSnapshot(folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
 }

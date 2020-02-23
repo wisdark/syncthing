@@ -8,7 +8,9 @@ package config
 
 import (
 	"fmt"
+	"runtime"
 
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/util"
 )
@@ -52,13 +54,14 @@ type OptionsConfiguration struct {
 	TrafficClass            int      `xml:"trafficClass" json:"trafficClass"`
 	DefaultFolderPath       string   `xml:"defaultFolderPath" json:"defaultFolderPath" default:"~"`
 	SetLowPriority          bool     `xml:"setLowPriority" json:"setLowPriority" default:"true"`
-	MaxConcurrentScans      int      `xml:"maxConcurrentScans" json:"maxConcurrentScans"`
+	RawMaxFolderConcurrency int      `xml:"maxFolderConcurrency" json:"maxFolderConcurrency"`
 	CRURL                   string   `xml:"crashReportingURL" json:"crURL" default:"https://crash.syncthing.net/newcrash"` // crash reporting URL
 	CREnabled               bool     `xml:"crashReportingEnabled" json:"crashReportingEnabled" default:"true" restart:"true"`
 	StunKeepaliveStartS     int      `xml:"stunKeepaliveStartS" json:"stunKeepaliveStartS" default:"180"` // 0 for off
 	StunKeepaliveMinS       int      `xml:"stunKeepaliveMinS" json:"stunKeepaliveMinS" default:"20"`      // 0 for off
 	RawStunServers          []string `xml:"stunServer" json:"stunServers" default:"default"`
 	DatabaseTuning          Tuning   `xml:"databaseTuning" json:"databaseTuning" restart:"true"`
+	RawMaxCIRequestKiB      int      `xml:"maxConcurrentIncomingRequestKiB" json:"maxConcurrentIncomingRequestKiB"`
 
 	DeprecatedUPnPEnabled        bool     `xml:"upnpEnabled,omitempty" json:"-"`
 	DeprecatedUPnPLeaseM         int      `xml:"upnpLeaseMinutes,omitempty" json:"-"`
@@ -66,6 +69,7 @@ type OptionsConfiguration struct {
 	DeprecatedUPnPTimeoutS       int      `xml:"upnpTimeoutSeconds,omitempty" json:"-"`
 	DeprecatedRelayServers       []string `xml:"relayServer,omitempty" json:"-"`
 	DeprecatedMinHomeDiskFreePct float64  `xml:"minHomeDiskFreePct,omitempty" json:"-"`
+	DeprecatedMaxConcurrentScans int      `xml:"maxConcurrentScans,omitempty" json:"-"`
 }
 
 func (opts OptionsConfiguration) Copy() OptionsConfiguration {
@@ -151,4 +155,48 @@ func (opts OptionsConfiguration) GlobalDiscoveryServers() []string {
 		}
 	}
 	return util.UniqueTrimmedStrings(servers)
+}
+
+func (opts OptionsConfiguration) MaxFolderConcurrency() int {
+	// If a value is set, trust that.
+	if opts.RawMaxFolderConcurrency > 0 {
+		return opts.RawMaxFolderConcurrency
+	}
+	if opts.RawMaxFolderConcurrency < 0 {
+		// -1 etc means unlimited, which in the implementation means zero
+		return 0
+	}
+	// Otherwise default to the number of CPU cores in the system as a rough
+	// approximation of system powerfullness.
+	if n := runtime.GOMAXPROCS(-1); n > 0 {
+		return n
+	}
+	// We should never get here to begin with, but since we're here let's
+	// use some sort of reasonable compromise between the old "no limit" and
+	// getting nothing done... (Median number of folders out there at time
+	// of writing is two, 95-percentile at 12 folders.)
+	return 4 // https://xkcd.com/221/
+}
+
+func (opts OptionsConfiguration) MaxConcurrentIncomingRequestKiB() int {
+	// Negative is disabled, which in limiter land is spelled zero
+	if opts.RawMaxCIRequestKiB < 0 {
+		return 0
+	}
+
+	if opts.RawMaxFolderConcurrency == 0 {
+		// The default is 256 MiB
+		return 256 * 1024 // KiB
+	}
+
+	// We can't really do less than a couple of concurrent blocks or we'll
+	// pretty much stall completely. Check that an explicit value is large
+	// enough.
+	const minAllowed = 2 * protocol.MaxBlockSize / 1024
+	if opts.RawMaxCIRequestKiB < minAllowed {
+		return minAllowed
+	}
+
+	// Roll with it.
+	return opts.RawMaxCIRequestKiB
 }

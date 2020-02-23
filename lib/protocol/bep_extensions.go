@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/sha256"
 )
 
 const (
@@ -265,24 +266,36 @@ func BlocksEqual(a, b []BlockInfo) bool {
 }
 
 func (f *FileInfo) SetMustRescan(by ShortID) {
-	f.LocalFlags = FlagLocalMustRescan
-	f.ModifiedBy = by
-	f.Blocks = nil
-	f.Sequence = 0
+	f.setLocalFlags(by, FlagLocalMustRescan)
 }
 
 func (f *FileInfo) SetIgnored(by ShortID) {
-	f.LocalFlags = FlagLocalIgnored
-	f.ModifiedBy = by
-	f.Blocks = nil
-	f.Sequence = 0
+	f.setLocalFlags(by, FlagLocalIgnored)
 }
 
 func (f *FileInfo) SetUnsupported(by ShortID) {
-	f.LocalFlags = FlagLocalUnsupported
+	f.setLocalFlags(by, FlagLocalUnsupported)
+}
+
+func (f *FileInfo) SetDeleted(by ShortID) {
 	f.ModifiedBy = by
+	f.Deleted = true
+	f.Version = f.Version.Update(by)
+	f.ModifiedS = time.Now().Unix()
+	f.setNoContent()
+}
+
+func (f *FileInfo) setLocalFlags(by ShortID, flags uint32) {
+	f.RawInvalid = false
+	f.LocalFlags = flags
+	f.ModifiedBy = by
+	f.setNoContent()
+}
+
+func (f *FileInfo) setNoContent() {
 	f.Blocks = nil
-	f.Sequence = 0
+	f.BlocksHash = nil
+	f.Size = 0
 }
 
 func (b BlockInfo) String() string {
@@ -327,4 +340,12 @@ func (f Folder) Description() string {
 		return f.ID
 	}
 	return fmt.Sprintf("%q (%s)", f.Label, f.ID)
+}
+
+func BlocksHash(bs []BlockInfo) []byte {
+	h := sha256.New()
+	for _, b := range bs {
+		_, _ = h.Write(b.Hash)
+	}
+	return h.Sum(nil)
 }

@@ -7,9 +7,11 @@
 package db
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
+	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -22,9 +24,16 @@ import (
 //   5: v0.14.49
 //   6: v0.14.50
 //   7: v0.14.53
+//   8: v1.4.0
+//   9: v1.4.0
 const (
-	dbVersion             = 7
-	dbMinSyncthingVersion = "v0.14.53"
+	dbVersion             = 9
+	dbMinSyncthingVersion = "v1.4.0"
+)
+
+var (
+	errFolderIdxMissing = fmt.Errorf("folder db index missing")
+	errDeviceIdxMissing = fmt.Errorf("device db index missing")
 )
 
 type databaseDowngradeError struct {
@@ -68,35 +77,26 @@ func (db *schemaUpdater) updateSchema() error {
 		return nil
 	}
 
-	if prevVersion < 1 {
-		if err := db.updateSchema0to1(); err != nil {
-			return err
-		}
+	type migration struct {
+		schemaVersion int64
+		migration     func(prevVersion int) error
 	}
-	if prevVersion < 2 {
-		if err := db.updateSchema1to2(); err != nil {
-			return err
-		}
+	var migrations = []migration{
+		{1, db.updateSchema0to1},
+		{2, db.updateSchema1to2},
+		{3, db.updateSchema2to3},
+		{5, db.updateSchemaTo5},
+		{6, db.updateSchema5to6},
+		{7, db.updateSchema6to7},
+		{9, db.updateSchemato9},
 	}
-	if prevVersion < 3 {
-		if err := db.updateSchema2to3(); err != nil {
-			return err
-		}
-	}
-	// This update fixes problems existing in versions 3 and 4
-	if prevVersion == 3 || prevVersion == 4 {
-		if err := db.updateSchemaTo5(); err != nil {
-			return err
-		}
-	}
-	if prevVersion < 6 {
-		if err := db.updateSchema5to6(); err != nil {
-			return err
-		}
-	}
-	if prevVersion < 7 {
-		if err := db.updateSchema6to7(); err != nil {
-			return err
+
+	for _, m := range migrations {
+		if prevVersion < m.schemaVersion {
+			l.Infof("Migrating database to schema version %d...", m.schemaVersion)
+			if err := m.migration(int(prevVersion)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -107,10 +107,11 @@ func (db *schemaUpdater) updateSchema() error {
 		return err
 	}
 
-	return nil
+	l.Infoln("Compacting database after migration...")
+	return db.Compact()
 }
 
-func (db *schemaUpdater) updateSchema0to1() error {
+func (db *schemaUpdater) updateSchema0to1(_ int) error {
 	t, err := db.newReadWriteTransaction()
 	if err != nil {
 		return err
@@ -211,12 +212,12 @@ func (db *schemaUpdater) updateSchema0to1() error {
 			return err
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 // updateSchema1to2 introduces a sequenceKey->deviceKey bucket for local items
 // to allow iteration in sequence order (simplifies sending indexes).
-func (db *schemaUpdater) updateSchema1to2() error {
+func (db *schemaUpdater) updateSchema1to2(_ int) error {
 	t, err := db.newReadWriteTransaction()
 	if err != nil {
 		return err
@@ -228,7 +229,7 @@ func (db *schemaUpdater) updateSchema1to2() error {
 	for _, folderStr := range db.ListFolders() {
 		folder := []byte(folderStr)
 		var putErr error
-		err := db.withHave(folder, protocol.LocalDeviceID[:], nil, true, func(f FileIntf) bool {
+		err := t.withHave(folder, protocol.LocalDeviceID[:], nil, true, func(f FileIntf) bool {
 			sk, putErr = db.keyer.GenerateSequenceKey(sk, folder, f.SequenceNo())
 			if putErr != nil {
 				return false
@@ -247,11 +248,11 @@ func (db *schemaUpdater) updateSchema1to2() error {
 			return err
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 // updateSchema2to3 introduces a needKey->nil bucket for locally needed files.
-func (db *schemaUpdater) updateSchema2to3() error {
+func (db *schemaUpdater) updateSchema2to3(_ int) error {
 	t, err := db.newReadWriteTransaction()
 	if err != nil {
 		return err
@@ -263,7 +264,7 @@ func (db *schemaUpdater) updateSchema2to3() error {
 	for _, folderStr := range db.ListFolders() {
 		folder := []byte(folderStr)
 		var putErr error
-		err := db.withGlobal(folder, nil, true, func(f FileIntf) bool {
+		err := t.withGlobal(folder, nil, true, func(f FileIntf) bool {
 			name := []byte(f.FileName())
 			dk, putErr = db.keyer.GenerateDeviceFileKey(dk, folder, protocol.LocalDeviceID[:], name)
 			if putErr != nil {
@@ -295,14 +296,18 @@ func (db *schemaUpdater) updateSchema2to3() error {
 			return err
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 // updateSchemaTo5 resets the need bucket due to bugs existing in the v0.14.49
 // release candidates (dbVersion 3 and 4)
 // https://github.com/syncthing/syncthing/issues/5007
 // https://github.com/syncthing/syncthing/issues/5053
-func (db *schemaUpdater) updateSchemaTo5() error {
+func (db *schemaUpdater) updateSchemaTo5(prevVersion int) error {
+	if prevVersion != 3 && prevVersion != 4 {
+		return nil
+	}
+
 	t, err := db.newReadWriteTransaction()
 	if err != nil {
 		return err
@@ -317,14 +322,14 @@ func (db *schemaUpdater) updateSchemaTo5() error {
 			return err
 		}
 	}
-	if err := t.commit(); err != nil {
+	if err := t.Commit(); err != nil {
 		return err
 	}
 
-	return db.updateSchema2to3()
+	return db.updateSchema2to3(2)
 }
 
-func (db *schemaUpdater) updateSchema5to6() error {
+func (db *schemaUpdater) updateSchema5to6(_ int) error {
 	// For every local file with the Invalid bit set, clear the Invalid bit and
 	// set LocalFlags = FlagLocalIgnored.
 
@@ -339,7 +344,7 @@ func (db *schemaUpdater) updateSchema5to6() error {
 	for _, folderStr := range db.ListFolders() {
 		folder := []byte(folderStr)
 		var putErr error
-		err := db.withHave(folder, protocol.LocalDeviceID[:], nil, false, func(f FileIntf) bool {
+		err := t.withHave(folder, protocol.LocalDeviceID[:], nil, false, func(f FileIntf) bool {
 			if !f.IsInvalid() {
 				return true
 			}
@@ -364,12 +369,12 @@ func (db *schemaUpdater) updateSchema5to6() error {
 			return err
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 // updateSchema6to7 checks whether all currently locally needed files are really
 // needed and removes them if not.
-func (db *schemaUpdater) updateSchema6to7() error {
+func (db *schemaUpdater) updateSchema6to7(_ int) error {
 	t, err := db.newReadWriteTransaction()
 	if err != nil {
 		return err
@@ -382,7 +387,7 @@ func (db *schemaUpdater) updateSchema6to7() error {
 	for _, folderStr := range db.ListFolders() {
 		folder := []byte(folderStr)
 		var delErr error
-		err := db.withNeedLocal(folder, false, func(f FileIntf) bool {
+		err := t.withNeedLocal(folder, false, func(f FileIntf) bool {
 			name := []byte(f.FileName())
 			global := f.(protocol.FileInfo)
 			gk, delErr = db.keyer.GenerateGlobalVersionKey(gk, folder, name)
@@ -421,5 +426,91 @@ func (db *schemaUpdater) updateSchema6to7() error {
 			return err
 		}
 	}
-	return t.commit()
+	return t.Commit()
+}
+
+func (db *schemaUpdater) updateSchemato9(prev int) error {
+	// Loads and rewrites all files with blocks, to deduplicate block lists.
+	// Checks for missing or incorrect sequence entries and rewrites those.
+
+	t, err := db.newReadWriteTransaction()
+	if err != nil {
+		return err
+	}
+	defer t.close()
+
+	var sk []byte
+	it, err := t.NewPrefixIterator([]byte{KeyTypeDevice})
+	if err != nil {
+		return err
+	}
+	metas := make(map[string]*metadataTracker)
+	for it.Next() {
+		var fi protocol.FileInfo
+		if err := fi.Unmarshal(it.Value()); err != nil {
+			return err
+		}
+		device, ok := t.keyer.DeviceFromDeviceFileKey(it.Key())
+		if !ok {
+			return errDeviceIdxMissing
+		}
+		if bytes.Equal(device, protocol.LocalDeviceID[:]) {
+			folder, ok := t.keyer.FolderFromDeviceFileKey(it.Key())
+			if !ok {
+				return errFolderIdxMissing
+			}
+			if sk, err = t.keyer.GenerateSequenceKey(sk, folder, fi.Sequence); err != nil {
+				return err
+			}
+			switch dk, err := t.Get(sk); {
+			case err != nil:
+				if !backend.IsNotFound(err) {
+					return err
+				}
+				fallthrough
+			case !bytes.Equal(it.Key(), dk):
+				folderStr := string(folder)
+				meta, ok := metas[folderStr]
+				if !ok {
+					meta = loadMetadataTracker(db.Lowlevel, folderStr)
+					metas[folderStr] = meta
+				}
+				fi.Sequence = meta.nextLocalSeq()
+				if sk, err = t.keyer.GenerateSequenceKey(sk, folder, fi.Sequence); err != nil {
+					return err
+				}
+				if err := t.Put(sk, it.Key()); err != nil {
+					return err
+				}
+				if err := t.putFile(it.Key(), fi); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if prev == 8 {
+			// The transition to 8 already did the changes below.
+			continue
+		}
+		if fi.Blocks == nil {
+			continue
+		}
+		if err := t.putFile(it.Key(), fi); err != nil {
+			return err
+		}
+	}
+	it.Release()
+	if err := it.Error(); err != nil {
+		return err
+	}
+
+	for folder, meta := range metas {
+		if err := meta.toDB(t, []byte(folder)); err != nil {
+			return err
+		}
+	}
+
+	db.recordTime(blockGCTimeKey)
+
+	return t.Commit()
 }

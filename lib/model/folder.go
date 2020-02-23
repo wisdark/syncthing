@@ -33,14 +33,12 @@ import (
 	"github.com/thejerf/suture"
 )
 
-// scanLimiter limits the number of concurrent scans. A limit of zero means no limit.
-var scanLimiter = newByteSemaphore(0)
-
 type folder struct {
 	suture.Service
 	stateTracker
 	config.FolderConfiguration
 	*stats.FolderStatisticsReference
+	ioLimiter *byteSemaphore
 
 	localFlags uint32
 
@@ -78,11 +76,12 @@ type puller interface {
 	pull() bool // true when successfull and should not be retried
 }
 
-func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger) folder {
+func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ioLimiter *byteSemaphore) folder {
 	return folder{
 		stateTracker:              newStateTracker(cfg.ID, evLogger),
 		FolderConfiguration:       cfg,
 		FolderStatisticsReference: stats.NewFolderStatisticsReference(model.db, cfg.ID),
+		ioLimiter:                 ioLimiter,
 
 		model:   model,
 		shortID: model.shortID,
@@ -130,7 +129,7 @@ func (f *folder) serve(ctx context.Context) {
 
 	pull := func() {
 		startTime := time.Now()
-		if f.puller.pull() {
+		if f.pull() {
 			// We're good. Don't schedule another pull and reset
 			// the pause interval.
 			pause = f.basePause()
@@ -164,7 +163,7 @@ func (f *folder) serve(ctx context.Context) {
 		case <-initialCompleted:
 			// Initial scan has completed, we should do a pull
 			initialCompleted = nil // never hit this case again
-			if !f.puller.pull() {
+			if !f.pull() {
 				// Pulling failed, try again later.
 				pullFailTimer.Reset(pause)
 			}
@@ -279,6 +278,35 @@ func (f *folder) getHealthError() error {
 	return nil
 }
 
+func (f *folder) pull() bool {
+	select {
+	case <-f.initialScanFinished:
+	default:
+		// Once the initial scan finished, a pull will be scheduled
+		return true
+	}
+
+	// If there is nothing to do, don't even enter sync-waiting state.
+	abort := true
+	snap := f.fset.Snapshot()
+	snap.WithNeed(protocol.LocalDeviceID, func(intf db.FileIntf) bool {
+		abort = false
+		return false
+	})
+	snap.Release()
+	if abort {
+		return true
+	}
+
+	f.setState(FolderSyncWaiting)
+	defer f.setState(FolderIdle)
+
+	f.ioLimiter.take(1)
+	defer f.ioLimiter.give(1)
+
+	return f.puller.pull()
+}
+
 func (f *folder) scanSubdirs(subDirs []string) error {
 	if err := f.getHealthError(); err != nil {
 		// If there is a health error we set it as the folder error. We do not
@@ -312,8 +340,8 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	f.setError(nil)
 	f.setState(FolderScanWaiting)
 
-	scanLimiter.take(1)
-	defer scanLimiter.give(1)
+	f.ioLimiter.take(1)
+	defer f.ioLimiter.give(1)
 
 	for i := range subDirs {
 		sub := osutil.NativeFilename(subDirs[i])
@@ -328,11 +356,16 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 		subDirs[i] = sub
 	}
 
+	snap := f.fset.Snapshot()
+	// We release explicitly later in this function, however we might exit early
+	// and it's ok to release twice.
+	defer snap.Release()
+
 	// Clean the list of subitems to ensure that we start at a known
 	// directory, and don't scan subdirectories of things we've already
 	// scanned.
 	subDirs = unifySubs(subDirs, func(file string) bool {
-		_, ok := f.fset.Get(protocol.LocalDeviceID, file)
+		_, ok := snap.Get(protocol.LocalDeviceID, file)
 		return ok
 	})
 
@@ -344,7 +377,7 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 		Subs:                  subDirs,
 		Matcher:               f.ignores,
 		TempLifetime:          time.Duration(f.model.cfg.Options().KeepTemporariesH) * time.Hour,
-		CurrentFiler:          cFiler{f.fset},
+		CurrentFiler:          cFiler{snap},
 		Filesystem:            mtimefs,
 		IgnorePerms:           f.IgnorePerms,
 		AutoNormalize:         f.AutoNormalize,
@@ -369,7 +402,7 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 		oldBatchFn := batchFn // can't reference batchFn directly (recursion)
 		batchFn = func(fs []protocol.FileInfo) error {
 			for i := range fs {
-				switch gf, ok := f.fset.GetGlobal(fs[i].Name); {
+				switch gf, ok := snap.GetGlobal(fs[i].Name); {
 				case !ok:
 					continue
 				case gf.IsEquivalentOptional(fs[i], f.ModTimeWindow(), false, false, protocol.FlagLocalReceiveOnly):
@@ -426,10 +459,15 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 	// ignored files.
 	var toIgnore []db.FileInfoTruncated
 	ignoredParent := ""
+
+	snap.Release()
+	snap = f.fset.Snapshot()
+	defer snap.Release()
+
 	for _, sub := range subDirs {
 		var iterError error
 
-		f.fset.WithPrefixedHaveTruncated(protocol.LocalDeviceID, sub, func(fi db.FileIntf) bool {
+		snap.WithPrefixedHaveTruncated(protocol.LocalDeviceID, sub, func(fi db.FileIntf) bool {
 			select {
 			case <-f.ctx.Done():
 				return false
@@ -494,22 +532,12 @@ func (f *folder) scanSubdirs(subDirs []string) error {
 					}
 					return true
 				}
-				nf := protocol.FileInfo{
-					Name:       file.Name,
-					Type:       file.Type,
-					Size:       0,
-					ModifiedS:  file.ModifiedS,
-					ModifiedNs: file.ModifiedNs,
-					ModifiedBy: f.shortID,
-					Deleted:    true,
-					Version:    file.Version.Update(f.shortID),
-					LocalFlags: f.localFlags,
-				}
-				// We do not want to override the global version
-				// with the deleted file. Setting to an empty
-				// version makes sure the file gets in sync on
-				// the following pull.
+				nf := file.ConvertToDeletedFileInfo(f.shortID)
+				nf.LocalFlags = f.localFlags
 				if file.ShouldConflict() {
+					// We do not want to override the global version with
+					// the deleted file. Setting to an empty version makes
+					// sure the file gets in sync on the following pull.
 					nf.Version = protocol.Vector{}
 				}
 
@@ -891,7 +919,7 @@ func unifySubs(dirs []string, exists func(dir string) bool) []string {
 }
 
 type cFiler struct {
-	*db.FileSet
+	*db.Snapshot
 }
 
 // Implements scanner.CurrentFiler
