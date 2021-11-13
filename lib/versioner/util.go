@@ -7,7 +7,7 @@
 package versioner
 
 import (
-	"fmt"
+	"context"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -15,14 +15,18 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/util"
 )
 
-var errDirectory = fmt.Errorf("cannot restore on top of a directory")
-var errNotFound = fmt.Errorf("version not found")
-var errFileAlreadyExists = fmt.Errorf("file already exists")
+var (
+	ErrDirectory         = errors.New("cannot restore on top of a directory")
+	errNotFound          = errors.New("version not found")
+	errFileAlreadyExists = errors.New("file already exists")
+)
 
 // TagFilename inserts ~tag just before the extension of the filename.
 func TagFilename(name, tag string) string {
@@ -128,7 +132,7 @@ func retrieveVersions(fileSystem fs.Filesystem) (map[string][]FileVersion, error
 
 type fileTagger func(string, string) string
 
-func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger) error {
+func archiveFile(method fs.CopyRangeMethod, srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger) error {
 	filePath = osutil.NativeFilename(filePath)
 	info, err := srcFs.Lstat(filePath)
 	if fs.IsNotExist(err) {
@@ -145,7 +149,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	if err != nil {
 		if fs.IsNotExist(err) {
 			l.Debugln("creating versions dir")
-			err := dstFs.Mkdir(".", 0755)
+			err := dstFs.MkdirAll(".", 0755)
 			if err != nil {
 				return err
 			}
@@ -169,7 +173,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	ver := tagger(file, now.Format(TimeFormat))
 	dst := filepath.Join(inFolderPath, ver)
 	l.Debugln("archiving", filePath, "moving to", dst)
-	err = osutil.RenameOrCopy(srcFs, dstFs, filePath, dst)
+	err = osutil.RenameOrCopy(method, srcFs, dstFs, filePath, dst)
 
 	mtime := info.ModTime()
 	// If it's a trashcan versioner type thing, then it does not have version time in the name
@@ -183,7 +187,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	return err
 }
 
-func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time, tagger fileTagger) error {
+func restoreFile(method fs.CopyRangeMethod, src, dst fs.Filesystem, filePath string, versionTime time.Time, tagger fileTagger) error {
 	tag := versionTime.In(time.Local).Truncate(time.Second).Format(TimeFormat)
 	taggedFilePath := tagger(filePath, tag)
 
@@ -192,14 +196,14 @@ func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time,
 	if info, err := dst.Lstat(filePath); err == nil {
 		switch {
 		case info.IsDir():
-			return errDirectory
+			return ErrDirectory
 		case info.IsSymlink():
 			// Remove existing symlinks (as we don't want to archive them)
 			if err := dst.Remove(filePath); err != nil {
 				return errors.Wrap(err, "removing existing symlink")
 			}
 		case info.IsRegular():
-			if err := archiveFile(dst, src, filePath, tagger); err != nil {
+			if err := archiveFile(method, dst, src, filePath, tagger); err != nil {
 				return errors.Wrap(err, "archiving existing file")
 			}
 		default:
@@ -246,27 +250,21 @@ func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time,
 	}
 
 	_ = dst.MkdirAll(filepath.Dir(filePath), 0755)
-	err := osutil.RenameOrCopy(src, dst, sourceFile, filePath)
+	err := osutil.RenameOrCopy(method, src, dst, sourceFile, filePath)
 	_ = dst.Chtimes(filePath, sourceMtime, sourceMtime)
 	return err
 }
 
-func fsFromParams(folderFs fs.Filesystem, params map[string]string) (versionsFs fs.Filesystem) {
-	if params["fsType"] == "" && params["fsPath"] == "" {
+func versionerFsFromFolderCfg(cfg config.FolderConfiguration) (versionsFs fs.Filesystem) {
+	folderFs := cfg.Filesystem()
+	if cfg.Versioning.FSPath == "" {
 		versionsFs = fs.NewFilesystem(folderFs.Type(), filepath.Join(folderFs.URI(), ".stversions"))
-
-	} else if params["fsType"] == "" {
-		uri := params["fsPath"]
+	} else if cfg.Versioning.FSType == fs.FilesystemTypeBasic && !filepath.IsAbs(cfg.Versioning.FSPath) {
 		// We only know how to deal with relative folders for basic filesystems, as that's the only one we know
 		// how to check if it's absolute or relative.
-		if folderFs.Type() == fs.FilesystemTypeBasic && !filepath.IsAbs(params["fsPath"]) {
-			uri = filepath.Join(folderFs.URI(), params["fsPath"])
-		}
-		versionsFs = fs.NewFilesystem(folderFs.Type(), uri)
+		versionsFs = fs.NewFilesystem(cfg.Versioning.FSType, filepath.Join(folderFs.URI(), cfg.Versioning.FSPath))
 	} else {
-		var fsType fs.FilesystemType
-		_ = fsType.UnmarshalText([]byte(params["fsType"]))
-		versionsFs = fs.NewFilesystem(fsType, params["fsPath"])
+		versionsFs = fs.NewFilesystem(cfg.Versioning.FSType, cfg.Versioning.FSPath)
 	}
 	l.Debugf("%s (%s) folder using %s (%s) versioner dir", folderFs.URI(), folderFs.Type(), versionsFs.URI(), versionsFs.Type())
 	return
@@ -287,4 +285,52 @@ func findAllVersions(fs fs.Filesystem, filePath string) []string {
 	sort.Strings(versions)
 
 	return versions
+}
+
+func cleanByDay(ctx context.Context, versionsFs fs.Filesystem, cleanoutDays int) error {
+	if cleanoutDays <= 0 {
+		return nil
+	}
+
+	if _, err := versionsFs.Lstat("."); fs.IsNotExist(err) {
+		return nil
+	}
+
+	cutoff := time.Now().Add(time.Duration(-24*cleanoutDays) * time.Hour)
+	dirTracker := make(emptyDirTracker)
+
+	walkFn := func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if info.IsDir() && !info.IsSymlink() {
+			dirTracker.addDir(path)
+			return nil
+		}
+
+		if info.ModTime().Before(cutoff) {
+			// The file is too old; remove it.
+			err = versionsFs.Remove(path)
+		} else {
+			// Keep this file, and remember it so we don't unnecessarily try
+			// to remove this directory.
+			dirTracker.addFile(path)
+		}
+		return err
+	}
+
+	if err := versionsFs.Walk(".", walkFn); err != nil {
+		return err
+	}
+
+	dirTracker.deleteEmptyDirs(versionsFs)
+
+	return nil
 }

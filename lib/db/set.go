@@ -13,8 +13,7 @@
 package db
 
 import (
-	"os"
-	"time"
+	"fmt"
 
 	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/fs"
@@ -32,145 +31,43 @@ type FileSet struct {
 	updateMutex sync.Mutex // protects database updates and the corresponding metadata changes
 }
 
-// FileIntf is the set of methods implemented by both protocol.FileInfo and
-// FileInfoTruncated.
-type FileIntf interface {
-	FileSize() int64
-	FileName() string
-	FileLocalFlags() uint32
-	IsDeleted() bool
-	IsInvalid() bool
-	IsIgnored() bool
-	IsUnsupported() bool
-	MustRescan() bool
-	IsReceiveOnlyChanged() bool
-	IsDirectory() bool
-	IsSymlink() bool
-	ShouldConflict() bool
-	HasPermissionBits() bool
-	SequenceNo() int64
-	BlockSize() int
-	FileVersion() protocol.Vector
-	FileType() protocol.FileInfoType
-	FilePermissions() uint32
-	FileModifiedBy() protocol.ShortID
-	ModTime() time.Time
-}
-
 // The Iterator is called with either a protocol.FileInfo or a
 // FileInfoTruncated (depending on the method) and returns true to
 // continue iteration, false to stop.
-type Iterator func(f FileIntf) bool
+type Iterator func(f protocol.FileIntf) bool
 
-var databaseRecheckInterval = 30 * 24 * time.Hour
-
-func init() {
-	if dur, err := time.ParseDuration(os.Getenv("STRECHECKDBEVERY")); err == nil {
-		databaseRecheckInterval = dur
+func NewFileSet(folder string, fs fs.Filesystem, db *Lowlevel) (*FileSet, error) {
+	select {
+	case <-db.oneFileSetCreated:
+	default:
+		close(db.oneFileSetCreated)
 	}
-}
-
-func NewFileSet(folder string, fs fs.Filesystem, db *Lowlevel) *FileSet {
-	return &FileSet{
+	meta, err := db.loadMetadataTracker(folder)
+	if err != nil {
+		db.handleFailure(err)
+		return nil, err
+	}
+	s := &FileSet{
 		folder:      folder,
 		fs:          fs,
 		db:          db,
-		meta:        loadMetadataTracker(db, folder),
+		meta:        meta,
 		updateMutex: sync.NewMutex(),
 	}
-}
-
-func loadMetadataTracker(db *Lowlevel, folder string) *metadataTracker {
-	meta := newMetadataTracker()
-
-	recalc := func() *metadataTracker {
-		if err := recalcMeta(meta, db, folder); backend.IsClosed(err) {
-			return nil
-		} else if err != nil {
-			panic(err)
+	if id := s.IndexID(protocol.LocalDeviceID); id == 0 {
+		// No index ID set yet. We create one now.
+		id = protocol.NewIndexID()
+		err := s.db.setIndexID(protocol.LocalDeviceID[:], []byte(s.folder), id)
+		if err != nil && !backend.IsClosed(err) {
+			fatalError(err, fmt.Sprintf("%s Creating new IndexID", s.folder), s.db)
 		}
-		return meta
 	}
-
-	if err := meta.fromDB(db, []byte(folder)); err != nil {
-		l.Infof("No stored folder metadata for %q; recalculating", folder)
-		return recalc()
-	}
-
-	if metaOK := verifyLocalSequence(meta, db, folder); !metaOK {
-		l.Infof("Stored folder metadata for %q is out of date after crash; recalculating", folder)
-		return recalc()
-	}
-
-	if age := time.Since(meta.Created()); age > databaseRecheckInterval {
-		l.Infof("Stored folder metadata for %q is %v old; recalculating", folder, age)
-		return recalc()
-	}
-
-	return meta
-}
-
-func recalcMeta(meta *metadataTracker, db *Lowlevel, folder string) error {
-	if err := db.checkGlobals([]byte(folder), meta); err != nil {
-		return err
-	}
-
-	t, err := db.newReadWriteTransaction()
-	if err != nil {
-		return err
-	}
-	defer t.close()
-
-	var deviceID protocol.DeviceID
-	err = t.withAllFolderTruncated([]byte(folder), func(device []byte, f FileInfoTruncated) bool {
-		copy(deviceID[:], device)
-		meta.addFile(deviceID, f)
-		return true
-	})
-	if err != nil {
-		return err
-	}
-
-	meta.SetCreated()
-	if err := meta.toDB(t, []byte(folder)); err != nil {
-		return err
-	}
-	return t.Commit()
-}
-
-// Verify the local sequence number from actual sequence entries. Returns
-// true if it was all good, or false if a fixup was necessary.
-func verifyLocalSequence(meta *metadataTracker, db *Lowlevel, folder string) bool {
-	// Walk the sequence index from the current (supposedly) highest
-	// sequence number and raise the alarm if we get anything. This recovers
-	// from the occasion where we have written sequence entries to disk but
-	// not yet written new metadata to disk.
-	//
-	// Note that we can have the same thing happen for remote devices but
-	// there it's not a problem -- we'll simply advertise a lower sequence
-	// number than we've actually seen and receive some duplicate updates
-	// and then be in sync again.
-
-	curSeq := meta.Sequence(protocol.LocalDeviceID)
-
-	t, err := db.newReadOnlyTransaction()
-	if err != nil {
-		panic(err)
-	}
-	ok := true
-	if err := t.withHaveSequence([]byte(folder), curSeq+1, func(fi FileIntf) bool {
-		ok = false // we got something, which we should not have
-		return false
-	}); err != nil && !backend.IsClosed(err) {
-		panic(err)
-	}
-	t.close()
-
-	return ok
+	return s, nil
 }
 
 func (s *FileSet) Drop(device protocol.DeviceID) {
-	l.Debugf("%s Drop(%v)", s.folder, device)
+	opStr := fmt.Sprintf("%s Drop(%v)", s.folder, device)
+	l.Debugf(opStr)
 
 	s.updateMutex.Lock()
 	defer s.updateMutex.Unlock()
@@ -178,7 +75,7 @@ func (s *FileSet) Drop(device protocol.DeviceID) {
 	if err := s.db.dropDeviceFolder(device[:], []byte(s.folder), s.meta); backend.IsClosed(err) {
 		return
 	} else if err != nil {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 
 	if device == protocol.LocalDeviceID {
@@ -200,29 +97,36 @@ func (s *FileSet) Drop(device protocol.DeviceID) {
 	if backend.IsClosed(err) {
 		return
 	} else if err != nil {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 	defer t.close()
 
 	if err := s.meta.toDB(t, []byte(s.folder)); backend.IsClosed(err) {
 		return
 	} else if err != nil {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 	if err := t.Commit(); backend.IsClosed(err) {
 		return
 	} else if err != nil {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 }
 
 func (s *FileSet) Update(device protocol.DeviceID, fs []protocol.FileInfo) {
-	l.Debugf("%s Update(%v, [%d])", s.folder, device, len(fs))
+	opStr := fmt.Sprintf("%s Update(%v, [%d])", s.folder, device, len(fs))
+	l.Debugf(opStr)
 
 	// do not modify fs in place, it is still used in outer scope
 	fs = append([]protocol.FileInfo(nil), fs...)
 
-	normalizeFilenames(fs)
+	// If one file info is present multiple times, only keep the last.
+	// Updating the same file multiple times is problematic, because the
+	// previous updates won't yet be represented in the db when we update it
+	// again. Additionally even if that problem was taken care of, it would
+	// be pointless because we remove the previously added file info again
+	// right away.
+	fs = normalizeFilenamesAndDropDuplicates(fs)
 
 	s.updateMutex.Lock()
 	defer s.updateMutex.Unlock()
@@ -230,32 +134,55 @@ func (s *FileSet) Update(device protocol.DeviceID, fs []protocol.FileInfo) {
 	if device == protocol.LocalDeviceID {
 		// For the local device we have a bunch of metadata to track.
 		if err := s.db.updateLocalFiles([]byte(s.folder), fs, s.meta); err != nil && !backend.IsClosed(err) {
-			panic(err)
+			fatalError(err, opStr, s.db)
 		}
 		return
 	}
 	// Easy case, just update the files and we're done.
 	if err := s.db.updateRemoteFiles([]byte(s.folder), device[:], fs, s.meta); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		fatalError(err, opStr, s.db)
+	}
+}
+
+func (s *FileSet) RemoveLocalItems(items []string) {
+	opStr := fmt.Sprintf("%s RemoveLocalItems([%d])", s.folder, len(items))
+	l.Debugf(opStr)
+
+	s.updateMutex.Lock()
+	defer s.updateMutex.Unlock()
+
+	for i := range items {
+		items[i] = osutil.NormalizedFilename(items[i])
+	}
+
+	if err := s.db.removeLocalFiles([]byte(s.folder), items, s.meta); err != nil && !backend.IsClosed(err) {
+		fatalError(err, opStr, s.db)
 	}
 }
 
 type Snapshot struct {
-	folder string
-	t      readOnlyTransaction
-	meta   *countsMap
+	folder     string
+	t          readOnlyTransaction
+	meta       *countsMap
+	fatalError func(error, string)
 }
 
-func (s *FileSet) Snapshot() *Snapshot {
+func (s *FileSet) Snapshot() (*Snapshot, error) {
+	opStr := fmt.Sprintf("%s Snapshot()", s.folder)
+	l.Debugf(opStr)
 	t, err := s.db.newReadOnlyTransaction()
 	if err != nil {
-		panic(err)
+		s.db.handleFailure(err)
+		return nil, err
 	}
 	return &Snapshot{
 		folder: s.folder,
 		t:      t,
 		meta:   s.meta.Snapshot(),
-	}
+		fatalError: func(err error, opStr string) {
+			fatalError(err, opStr, s.db)
+		},
+	}, nil
 }
 
 func (s *Snapshot) Release() {
@@ -263,89 +190,102 @@ func (s *Snapshot) Release() {
 }
 
 func (s *Snapshot) WithNeed(device protocol.DeviceID, fn Iterator) {
-	l.Debugf("%s WithNeed(%v)", s.folder, device)
+	opStr := fmt.Sprintf("%s WithNeed(%v)", s.folder, device)
+	l.Debugf(opStr)
 	if err := s.t.withNeed([]byte(s.folder), device[:], false, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithNeedTruncated(device protocol.DeviceID, fn Iterator) {
-	l.Debugf("%s WithNeedTruncated(%v)", s.folder, device)
+	opStr := fmt.Sprintf("%s WithNeedTruncated(%v)", s.folder, device)
+	l.Debugf(opStr)
 	if err := s.t.withNeed([]byte(s.folder), device[:], true, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithHave(device protocol.DeviceID, fn Iterator) {
-	l.Debugf("%s WithHave(%v)", s.folder, device)
+	opStr := fmt.Sprintf("%s WithHave(%v)", s.folder, device)
+	l.Debugf(opStr)
 	if err := s.t.withHave([]byte(s.folder), device[:], nil, false, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithHaveTruncated(device protocol.DeviceID, fn Iterator) {
-	l.Debugf("%s WithHaveTruncated(%v)", s.folder, device)
+	opStr := fmt.Sprintf("%s WithHaveTruncated(%v)", s.folder, device)
+	l.Debugf(opStr)
 	if err := s.t.withHave([]byte(s.folder), device[:], nil, true, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithHaveSequence(startSeq int64, fn Iterator) {
-	l.Debugf("%s WithHaveSequence(%v)", s.folder, startSeq)
+	opStr := fmt.Sprintf("%s WithHaveSequence(%v)", s.folder, startSeq)
+	l.Debugf(opStr)
 	if err := s.t.withHaveSequence([]byte(s.folder), startSeq, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 // Except for an item with a path equal to prefix, only children of prefix are iterated.
 // E.g. for prefix "dir", "dir/file" is iterated, but "dir.file" is not.
 func (s *Snapshot) WithPrefixedHaveTruncated(device protocol.DeviceID, prefix string, fn Iterator) {
-	l.Debugf(`%s WithPrefixedHaveTruncated(%v, "%v")`, s.folder, device, prefix)
+	opStr := fmt.Sprintf(`%s WithPrefixedHaveTruncated(%v, "%v")`, s.folder, device, prefix)
+	l.Debugf(opStr)
 	if err := s.t.withHave([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(prefix)), true, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithGlobal(fn Iterator) {
-	l.Debugf("%s WithGlobal()", s.folder)
+	opStr := fmt.Sprintf("%s WithGlobal()", s.folder)
+	l.Debugf(opStr)
 	if err := s.t.withGlobal([]byte(s.folder), nil, false, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) WithGlobalTruncated(fn Iterator) {
-	l.Debugf("%s WithGlobalTruncated()", s.folder)
+	opStr := fmt.Sprintf("%s WithGlobalTruncated()", s.folder)
+	l.Debugf(opStr)
 	if err := s.t.withGlobal([]byte(s.folder), nil, true, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 // Except for an item with a path equal to prefix, only children of prefix are iterated.
 // E.g. for prefix "dir", "dir/file" is iterated, but "dir.file" is not.
 func (s *Snapshot) WithPrefixedGlobalTruncated(prefix string, fn Iterator) {
-	l.Debugf(`%s WithPrefixedGlobalTruncated("%v")`, s.folder, prefix)
+	opStr := fmt.Sprintf(`%s WithPrefixedGlobalTruncated("%v")`, s.folder, prefix)
+	l.Debugf(opStr)
 	if err := s.t.withGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(prefix)), true, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 }
 
 func (s *Snapshot) Get(device protocol.DeviceID, file string) (protocol.FileInfo, bool) {
+	opStr := fmt.Sprintf("%s Get(%v)", s.folder, file)
+	l.Debugf(opStr)
 	f, ok, err := s.t.getFile([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(file)))
 	if backend.IsClosed(err) {
 		return protocol.FileInfo{}, false
 	} else if err != nil {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 	f.Name = osutil.NativeFilename(f.Name)
 	return f, ok
 }
 
 func (s *Snapshot) GetGlobal(file string) (protocol.FileInfo, bool) {
+	opStr := fmt.Sprintf("%s GetGlobal(%v)", s.folder, file)
+	l.Debugf(opStr)
 	_, fi, ok, err := s.t.getGlobal(nil, []byte(s.folder), []byte(osutil.NormalizedFilename(file)), false)
 	if backend.IsClosed(err) {
 		return protocol.FileInfo{}, false
 	} else if err != nil {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 	if !ok {
 		return protocol.FileInfo{}, false
@@ -356,11 +296,13 @@ func (s *Snapshot) GetGlobal(file string) (protocol.FileInfo, bool) {
 }
 
 func (s *Snapshot) GetGlobalTruncated(file string) (FileInfoTruncated, bool) {
+	opStr := fmt.Sprintf("%s GetGlobalTruncated(%v)", s.folder, file)
+	l.Debugf(opStr)
 	_, fi, ok, err := s.t.getGlobal(nil, []byte(s.folder), []byte(osutil.NormalizedFilename(file)), true)
 	if backend.IsClosed(err) {
 		return FileInfoTruncated{}, false
 	} else if err != nil {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 	if !ok {
 		return FileInfoTruncated{}, false
@@ -371,13 +313,27 @@ func (s *Snapshot) GetGlobalTruncated(file string) (FileInfoTruncated, bool) {
 }
 
 func (s *Snapshot) Availability(file string) []protocol.DeviceID {
+	opStr := fmt.Sprintf("%s Availability(%v)", s.folder, file)
+	l.Debugf(opStr)
 	av, err := s.t.availability([]byte(s.folder), []byte(osutil.NormalizedFilename(file)))
 	if backend.IsClosed(err) {
 		return nil
 	} else if err != nil {
-		panic(err)
+		s.fatalError(err, opStr)
 	}
 	return av
+}
+
+func (s *Snapshot) DebugGlobalVersions(file string) VersionList {
+	opStr := fmt.Sprintf("%s DebugGlobalVersions(%v)", s.folder, file)
+	l.Debugf(opStr)
+	vl, err := s.t.getGlobalVersions(nil, []byte(s.folder), []byte(osutil.NormalizedFilename(file)))
+	if backend.IsClosed(err) || backend.IsNotFound(err) {
+		return VersionList{}
+	} else if err != nil {
+		s.fatalError(err, opStr)
+	}
+	return vl
 }
 
 func (s *Snapshot) Sequence(device protocol.DeviceID) int64 {
@@ -407,77 +363,19 @@ func (s *Snapshot) ReceiveOnlyChangedSize() Counts {
 }
 
 func (s *Snapshot) GlobalSize() Counts {
-	global := s.meta.Counts(protocol.GlobalDeviceID, 0)
-	recvOnlyChanged := s.meta.Counts(protocol.GlobalDeviceID, protocol.FlagLocalReceiveOnly)
-	return global.Add(recvOnlyChanged)
+	return s.meta.Counts(protocol.GlobalDeviceID, 0)
 }
 
-func (s *Snapshot) NeedSize() Counts {
-	var result Counts
-	s.WithNeedTruncated(protocol.LocalDeviceID, func(f FileIntf) bool {
-		switch {
-		case f.IsDeleted():
-			result.Deleted++
-		case f.IsDirectory():
-			result.Directories++
-		case f.IsSymlink():
-			result.Symlinks++
-		default:
-			result.Files++
-			result.Bytes += f.FileSize()
-		}
-		return true
-	})
-	return result
+func (s *Snapshot) NeedSize(device protocol.DeviceID) Counts {
+	return s.meta.Counts(device, needFlag)
 }
 
-// LocalChangedFiles returns a paginated list of currently needed files in
-// progress, queued, and to be queued on next puller iteration, as well as the
-// total number of files currently needed.
-func (s *Snapshot) LocalChangedFiles(page, perpage int) []FileInfoTruncated {
-	if s.ReceiveOnlyChangedSize().TotalItems() == 0 {
-		return nil
+func (s *Snapshot) WithBlocksHash(hash []byte, fn Iterator) {
+	opStr := fmt.Sprintf(`%s WithBlocksHash("%x")`, s.folder, hash)
+	l.Debugf(opStr)
+	if err := s.t.withBlocksHash([]byte(s.folder), hash, nativeFileIterator(fn)); err != nil && !backend.IsClosed(err) {
+		s.fatalError(err, opStr)
 	}
-
-	files := make([]FileInfoTruncated, 0, perpage)
-
-	skip := (page - 1) * perpage
-	get := perpage
-
-	s.WithHaveTruncated(protocol.LocalDeviceID, func(f FileIntf) bool {
-		if !f.IsReceiveOnlyChanged() {
-			return true
-		}
-		if skip > 0 {
-			skip--
-			return true
-		}
-		ft := f.(FileInfoTruncated)
-		files = append(files, ft)
-		get--
-		return get > 0
-	})
-
-	return files
-}
-
-// RemoteNeedFolderFiles returns paginated list of currently needed files in
-// progress, queued, and to be queued on next puller iteration, as well as the
-// total number of files currently needed.
-func (s *Snapshot) RemoteNeedFolderFiles(device protocol.DeviceID, page, perpage int) []FileInfoTruncated {
-	files := make([]FileInfoTruncated, 0, perpage)
-	skip := (page - 1) * perpage
-	get := perpage
-	s.WithNeedTruncated(device, func(f FileIntf) bool {
-		if skip > 0 {
-			skip--
-			return true
-		}
-		files = append(files, f.(FileInfoTruncated))
-		get--
-		return get > 0
-	})
-	return files
 }
 
 func (s *FileSet) Sequence(device protocol.DeviceID) int64 {
@@ -485,21 +383,13 @@ func (s *FileSet) Sequence(device protocol.DeviceID) int64 {
 }
 
 func (s *FileSet) IndexID(device protocol.DeviceID) protocol.IndexID {
+	opStr := fmt.Sprintf("%s IndexID(%v)", s.folder, device)
+	l.Debugf(opStr)
 	id, err := s.db.getIndexID(device[:], []byte(s.folder))
 	if backend.IsClosed(err) {
 		return 0
 	} else if err != nil {
-		panic(err)
-	}
-	if id == 0 && device == protocol.LocalDeviceID {
-		// No index ID set yet. We create one now.
-		id = protocol.NewIndexID()
-		err := s.db.setIndexID(device[:], []byte(s.folder), id)
-		if backend.IsClosed(err) {
-			return 0
-		} else if err != nil {
-			panic(err)
-		}
+		fatalError(err, opStr, s.db)
 	}
 	return id
 }
@@ -508,17 +398,21 @@ func (s *FileSet) SetIndexID(device protocol.DeviceID, id protocol.IndexID) {
 	if device == protocol.LocalDeviceID {
 		panic("do not explicitly set index ID for local device")
 	}
+	opStr := fmt.Sprintf("%s SetIndexID(%v, %v)", s.folder, device, id)
+	l.Debugf(opStr)
 	if err := s.db.setIndexID(device[:], []byte(s.folder), id); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 }
 
-func (s *FileSet) MtimeFS() *fs.MtimeFS {
+func (s *FileSet) MtimeFS() fs.Filesystem {
+	opStr := fmt.Sprintf("%s MtimeFS()", s.folder)
+	l.Debugf(opStr)
 	prefix, err := s.db.keyer.GenerateMtimesKey(nil, []byte(s.folder))
 	if backend.IsClosed(err) {
 		return nil
 	} else if err != nil {
-		panic(err)
+		fatalError(err, opStr, s.db)
 	}
 	kv := NewNamespacedKV(s.db, string(prefix))
 	return fs.NewMtimeFS(s.fs, kv)
@@ -528,52 +422,81 @@ func (s *FileSet) ListDevices() []protocol.DeviceID {
 	return s.meta.devices()
 }
 
+func (s *FileSet) RepairSequence() (int, error) {
+	s.updateAndGCMutexLock() // Ensures consistent locking order
+	defer s.updateMutex.Unlock()
+	defer s.db.gcMut.RUnlock()
+	return s.db.repairSequenceGCLocked(s.folder, s.meta)
+}
+
+func (s *FileSet) updateAndGCMutexLock() {
+	s.updateMutex.Lock()
+	s.db.gcMut.RLock()
+}
+
 // DropFolder clears out all information related to the given folder from the
 // database.
 func DropFolder(db *Lowlevel, folder string) {
+	opStr := fmt.Sprintf("DropFolder(%v)", folder)
+	l.Debugf(opStr)
 	droppers := []func([]byte) error{
 		db.dropFolder,
 		db.dropMtimes,
 		db.dropFolderMeta,
+		db.dropFolderIndexIDs,
 		db.folderIdx.Delete,
 	}
 	for _, drop := range droppers {
 		if err := drop([]byte(folder)); backend.IsClosed(err) {
 			return
 		} else if err != nil {
-			panic(err)
+			fatalError(err, opStr, db)
 		}
 	}
 }
 
 // DropDeltaIndexIDs removes all delta index IDs from the database.
 // This will cause a full index transmission on the next connection.
+// Must be called before using FileSets, i.e. before NewFileSet is called for
+// the first time.
 func DropDeltaIndexIDs(db *Lowlevel) {
-	dbi, err := db.NewPrefixIterator([]byte{KeyTypeIndexID})
+	select {
+	case <-db.oneFileSetCreated:
+		panic("DropDeltaIndexIDs must not be called after NewFileSet for the same Lowlevel")
+	default:
+	}
+	opStr := "DropDeltaIndexIDs"
+	l.Debugf(opStr)
+	err := db.dropIndexIDs()
 	if backend.IsClosed(err) {
 		return
 	} else if err != nil {
-		panic(err)
-	}
-	defer dbi.Release()
-	for dbi.Next() {
-		if err := db.Delete(dbi.Key()); err != nil && !backend.IsClosed(err) {
-			panic(err)
-		}
-	}
-	if err := dbi.Error(); err != nil && !backend.IsClosed(err) {
-		panic(err)
+		fatalError(err, opStr, db)
 	}
 }
 
-func normalizeFilenames(fs []protocol.FileInfo) {
-	for i := range fs {
-		fs[i].Name = osutil.NormalizedFilename(fs[i].Name)
+func normalizeFilenamesAndDropDuplicates(fs []protocol.FileInfo) []protocol.FileInfo {
+	positions := make(map[string]int, len(fs))
+	for i, f := range fs {
+		norm := osutil.NormalizedFilename(f.Name)
+		if pos, ok := positions[norm]; ok {
+			fs[pos] = protocol.FileInfo{}
+		}
+		positions[norm] = i
+		fs[i].Name = norm
 	}
+	for i := 0; i < len(fs); {
+		if fs[i].Name == "" {
+			fs = append(fs[:i], fs[i+1:]...)
+			continue
+		}
+		i++
+	}
+	return fs
 }
 
 func nativeFileIterator(fn Iterator) Iterator {
-	return func(fi FileIntf) bool {
+	return func(fi protocol.FileIntf) bool {
 		switch f := fi.(type) {
 		case protocol.FileInfo:
 			f.Name = osutil.NativeFilename(f.Name)
@@ -585,4 +508,10 @@ func nativeFileIterator(fn Iterator) Iterator {
 			panic("unknown interface type")
 		}
 	}
+}
+
+func fatalError(err error, opStr string, db *Lowlevel) {
+	db.checkErrorForRepair(err)
+	l.Warnf("Fatal error: %v: %v", opStr, err)
+	panic(ldbPathRe.ReplaceAllString(err.Error(), "$1 x: "))
 }

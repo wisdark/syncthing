@@ -4,18 +4,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Command stcrashreceiver is a trivial HTTP server that allows two things:
-//
-// - uploading files (crash reports) named like a SHA256 hash using a PUT request
-// - checking whether such file exists using a HEAD request
-//
-// Typically this should be deployed behind something that manages HTTPS.
 package main
 
 import (
 	"bytes"
 	"compress/gzip"
-	"flag"
 	"io"
 	"io/ioutil"
 	"log"
@@ -25,25 +18,6 @@ import (
 	"path/filepath"
 	"strings"
 )
-
-const maxRequestSize = 1 << 20 // 1 MiB
-
-func main() {
-	dir := flag.String("dir", ".", "Directory to store reports in")
-	dsn := flag.String("dsn", "", "Sentry DSN")
-	listen := flag.String("listen", ":22039", "HTTP listen address")
-	flag.Parse()
-
-	cr := &crashReceiver{
-		dir: *dir,
-		dsn: *dsn,
-	}
-
-	log.SetOutput(os.Stdout)
-	if err := http.ListenAndServe(*listen, cr); err != nil {
-		log.Fatalln("HTTP serve:", err)
-	}
-}
 
 type crashReceiver struct {
 	dir string
@@ -145,10 +119,18 @@ func (r *crashReceiver) servePut(reportID, fullPath string, w http.ResponseWrite
 
 	// Send the report to Sentry
 	if r.dsn != "" {
+		// Remote ID
+		user := userIDFor(req)
+
 		go func() {
 			// There's no need for the client to have to wait for this part.
-			if err := sendReport(r.dsn, reportID, bs); err != nil {
-				log.Println("Failed to send report:", err)
+			pkt, err := parseCrashReport(reportID, bs)
+			if err != nil {
+				log.Println("Failed to parse crash report:", err)
+				return
+			}
+			if err := sendReport(r.dsn, pkt, user); err != nil {
+				log.Println("Failed to send crash report:", err)
 			}
 		}()
 	}

@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
@@ -25,7 +26,7 @@ import (
 func TestOverride(t *testing.T) {
 	// Enable "send-only" on s1/default
 	id, _ := protocol.DeviceIDFromString(id1)
-	cfg, _ := config.Load("h1/config.xml", id, events.NoopLogger)
+	cfg, _, _ := config.Load("h1/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Type = config.FolderTypeSendOnly
 	cfg.SetFolder(fld)
@@ -157,7 +158,7 @@ get to completion when in sendOnly/sendRecv mode. Needs fixing.
 func TestOverrideIgnores(t *testing.T) {
 	// Enable "sendOnly" on s1/default
 	id, _ := protocol.DeviceIDFromString(id1)
-	cfg, _ := config.Load("h1/config.xml", id, events.NoopLogger)
+	cfg, _, _ := config.Load("h1/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.ReadOnly = true
 	cfg.SetFolder(fld)
@@ -198,7 +199,7 @@ func TestOverrideIgnores(t *testing.T) {
 	log.Println("Starting sendOnly...")
 	sendOnly := syncthingProcess{ // id1
 		instance: "1",
-		argv:     []string{"-home", "h1"},
+		argv:     []string{"--home", "h1"},
 		port:     8081,
 		apiKey:   apiKey,
 	}
@@ -211,7 +212,7 @@ func TestOverrideIgnores(t *testing.T) {
 	log.Println("Starting sendRecv...")
 	sendRecv := syncthingProcess{ // id2
 		instance: "2",
-		argv:     []string{"-home", "h2"},
+		argv:     []string{"--home", "h2"},
 		port:     8082,
 		apiKey:   apiKey,
 	}

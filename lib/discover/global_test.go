@@ -107,13 +107,8 @@ func TestGlobalOverHTTP(t *testing.T) {
 }
 
 func TestGlobalOverHTTPS(t *testing.T) {
-	dir, err := ioutil.TempDir("", "syncthing")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// Generate a server certificate.
-	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing", 30)
+	cert, err := tlsutil.NewCertificateInMemory("syncthing", 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,13 +167,8 @@ func TestGlobalOverHTTPS(t *testing.T) {
 }
 
 func TestGlobalAnnounce(t *testing.T) {
-	dir, err := ioutil.TempDir("", "syncthing")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// Generate a server certificate.
-	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing", 30)
+	cert, err := tlsutil.NewCertificateInMemory("syncthing", 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,8 +190,9 @@ func TestGlobalAnnounce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go disco.Serve()
-	defer disco.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	go disco.Serve(ctx)
+	defer cancel()
 
 	// The discovery thing should attempt an announcement immediately. We wait
 	// for it to succeed, a while.
@@ -223,8 +214,9 @@ func testLookup(url string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	go disco.Serve()
-	defer disco.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	go disco.Serve(ctx)
+	defer cancel()
 
 	return disco.Lookup(context.Background(), protocol.LocalDeviceID)
 }

@@ -20,7 +20,8 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -56,13 +57,13 @@ func main() {
 
 	if join {
 		log.Println("Creating client")
-		relay, err := client.NewClient(uri, []tls.Certificate{cert}, nil, 10*time.Second)
+		relay, err := client.NewClient(uri, []tls.Certificate{cert}, 10*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Println("Created client")
 
-		go relay.Serve()
+		go relay.Serve(ctx)
 
 		recv := make(chan protocol.SessionInvitation)
 
@@ -107,10 +108,10 @@ func main() {
 		connectToStdio(stdin, conn)
 		log.Println("Finished", conn.RemoteAddr(), conn.LocalAddr())
 	} else if test {
-		if client.TestRelay(ctx, uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4) {
+		if err := client.TestRelay(ctx, uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4); err == nil {
 			log.Println("OK")
 		} else {
-			log.Println("FAIL")
+			log.Println("FAIL:", err)
 		}
 	} else {
 		log.Fatal("Requires either join or connect")

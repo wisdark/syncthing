@@ -7,12 +7,14 @@
 package model
 
 import (
+	"encoding/binary"
 	"io"
 	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 )
@@ -32,6 +34,7 @@ type sharedPullerState struct {
 	curFile     protocol.FileInfo // The file as it exists now in our database
 	sparse      bool
 	created     time.Time
+	fsync       bool
 
 	// Mutable, must be locked for access
 	err               error           // The first error we hit
@@ -44,9 +47,32 @@ type sharedPullerState struct {
 	pullNeeded        int             // Number of block pulls still pending
 	updated           time.Time       // Time when any of the counters above were last updated
 	closed            bool            // True if the file has been finalClosed.
-	available         []int32         // Indexes of the blocks that are available in the temporary file
+	available         []int           // Indexes of the blocks that are available in the temporary file
 	availableUpdated  time.Time       // Time when list of available blocks was last updated
 	mut               sync.RWMutex    // Protects the above
+}
+
+func newSharedPullerState(file protocol.FileInfo, fs fs.Filesystem, folderID, tempName string, blocks []protocol.BlockInfo, reused []int, ignorePerms, hasCurFile bool, curFile protocol.FileInfo, sparse bool, fsync bool) *sharedPullerState {
+	return &sharedPullerState{
+		file:             file,
+		fs:               fs,
+		folder:           folderID,
+		tempName:         tempName,
+		realName:         file.Name,
+		copyTotal:        len(blocks),
+		copyNeeded:       len(blocks),
+		reused:           len(reused),
+		updated:          time.Now(),
+		available:        reused,
+		availableUpdated: time.Now(),
+		ignorePerms:      ignorePerms,
+		hasCurFile:       hasCurFile,
+		curFile:          curFile,
+		mut:              sync.NewRWMutex(),
+		sparse:           sparse,
+		fsync:            fsync,
+		created:          time.Now(),
+	}
 }
 
 // A momentary state representing the progress of the puller
@@ -79,20 +105,22 @@ func (w *lockedWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 
 // SyncClose ensures that no more writes are happening before going ahead and
 // syncing and closing the fd, thus needs to acquire a write-lock.
-func (w *lockedWriterAt) SyncClose() error {
+func (w *lockedWriterAt) SyncClose(fsync bool) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
-	if err := w.fd.Sync(); err != nil {
-		// Sync() is nice if it works but not worth failing the
-		// operation over if it fails.
-		l.Debugf("fsync failed: %v", err)
+	if fsync {
+		if err := w.fd.Sync(); err != nil {
+			// Sync() is nice if it works but not worth failing the
+			// operation over if it fails.
+			l.Debugf("fsync failed: %v", err)
+		}
 	}
 	return w.fd.Close()
 }
 
 // tempFile returns the fd for the temporary file, reusing an open fd
 // or creating the file as necessary.
-func (s *sharedPullerState) tempFile() (io.WriterAt, error) {
+func (s *sharedPullerState) tempFile() (*lockedWriterAt, error) {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 
@@ -106,12 +134,16 @@ func (s *sharedPullerState) tempFile() (io.WriterAt, error) {
 		return s.writer, nil
 	}
 
-	if err := inWritableDir(s.tempFileInWritableDir, s.fs, s.tempName, s.ignorePerms); err != nil {
+	if err := s.addWriterLocked(); err != nil {
 		s.failLocked(err)
 		return nil, err
 	}
 
 	return s.writer, nil
+}
+
+func (s *sharedPullerState) addWriterLocked() error {
+	return inWritableDir(s.tempFileInWritableDir, s.fs, s.tempName, s.ignorePerms)
 }
 
 // tempFileInWritableDir should only be called from tempFile.
@@ -159,9 +191,14 @@ func (s *sharedPullerState) tempFileInWritableDir(_ string) error {
 	// Don't truncate symlink files, as that will mean that the path will
 	// contain a bunch of nulls.
 	if s.sparse && !s.file.IsSymlink() {
+		size := s.file.Size
+		// Trailer added to encrypted files
+		if len(s.file.Encrypted) > 0 {
+			size += encryptionTrailerSize(s.file)
+		}
 		// Truncate sets the size of the file. This creates a sparse file or a
 		// space reservation, depending on the underlying filesystem.
-		if err := fd.Truncate(s.file.Size); err != nil {
+		if err := fd.Truncate(size); err != nil {
 			// The truncate call failed. That can happen in some cases when
 			// space reservation isn't possible or over some network
 			// filesystems... This generally doesn't matter.
@@ -219,7 +256,7 @@ func (s *sharedPullerState) copyDone(block protocol.BlockInfo) {
 	s.mut.Lock()
 	s.copyNeeded--
 	s.updated = time.Now()
-	s.available = append(s.available, int32(block.Offset/int64(s.file.BlockSize())))
+	s.available = append(s.available, int(block.Offset/int64(s.file.BlockSize())))
 	s.availableUpdated = time.Now()
 	l.Debugln("sharedPullerState", s.folder, s.file.Name, "copyNeeded ->", s.copyNeeded)
 	s.mut.Unlock()
@@ -255,7 +292,7 @@ func (s *sharedPullerState) pullDone(block protocol.BlockInfo) {
 	s.mut.Lock()
 	s.pullNeeded--
 	s.updated = time.Now()
-	s.available = append(s.available, int32(block.Offset/int64(s.file.BlockSize())))
+	s.available = append(s.available, int(block.Offset/int64(s.file.BlockSize())))
 	s.availableUpdated = time.Now()
 	l.Debugln("sharedPullerState", s.folder, s.file.Name, "pullNeeded done ->", s.pullNeeded)
 	s.mut.Unlock()
@@ -280,8 +317,15 @@ func (s *sharedPullerState) finalClose() (bool, error) {
 		return false, nil
 	}
 
+	if len(s.file.Encrypted) > 0 {
+		if err := s.finalizeEncrypted(); err != nil && s.err == nil {
+			// This is our error as we weren't errored before.
+			s.err = err
+		}
+	}
+
 	if s.writer != nil {
-		if err := s.writer.SyncClose(); err != nil && s.err == nil {
+		if err := s.writer.SyncClose(s.fsync); err != nil && s.err == nil {
 			// This is our error as we weren't errored before.
 			s.err = err
 		}
@@ -299,12 +343,54 @@ func (s *sharedPullerState) finalClose() (bool, error) {
 	return true, s.err
 }
 
+// finalizeEncrypted adds a trailer to the encrypted file containing the
+// serialized FileInfo and the length of that FileInfo. When initializing a
+// folder from encrypted data we can extract this FileInfo from the end of
+// the file and regain the original metadata.
+func (s *sharedPullerState) finalizeEncrypted() error {
+	if s.writer == nil {
+		if err := s.addWriterLocked(); err != nil {
+			return err
+		}
+	}
+	_, err := writeEncryptionTrailer(s.file, s.writer)
+	return err
+}
+
+// Returns the size of the written trailer.
+func writeEncryptionTrailer(file protocol.FileInfo, writer io.WriterAt) (int64, error) {
+	// Here the file is in native format, while encryption happens in
+	// wire format (always slashes).
+	wireFile := file
+	wireFile.Name = osutil.NormalizedFilename(wireFile.Name)
+
+	trailerSize := encryptionTrailerSize(wireFile)
+	bs := make([]byte, trailerSize)
+	n, err := wireFile.MarshalTo(bs)
+	if err != nil {
+		return 0, err
+	}
+	binary.BigEndian.PutUint32(bs[n:], uint32(n))
+	bs = bs[:n+4]
+
+	if _, err := writer.WriteAt(bs, wireFile.Size); err != nil {
+		return 0, err
+	}
+
+	return trailerSize, nil
+}
+
+func encryptionTrailerSize(file protocol.FileInfo) int64 {
+	return int64(file.ProtoSize()) + 4
+}
+
 // Progress returns the momentarily progress for the puller
 func (s *sharedPullerState) Progress() *pullerProgress {
 	s.mut.RLock()
 	defer s.mut.RUnlock()
 	total := s.reused + s.copyTotal + s.pullTotal
 	done := total - s.copyNeeded - s.pullNeeded
+	file := len(s.file.Blocks)
 	return &pullerProgress{
 		Total:               total,
 		Reused:              s.reused,
@@ -312,8 +398,8 @@ func (s *sharedPullerState) Progress() *pullerProgress {
 		CopiedFromElsewhere: s.copyTotal - s.copyNeeded - s.copyOrigin,
 		Pulled:              s.pullTotal - s.pullNeeded,
 		Pulling:             s.pullNeeded,
-		BytesTotal:          blocksToSize(s.file.BlockSize(), total),
-		BytesDone:           blocksToSize(s.file.BlockSize(), done),
+		BytesTotal:          blocksToSize(total, file, s.file.BlockSize(), s.file.Size),
+		BytesDone:           blocksToSize(done, file, s.file.BlockSize(), s.file.Size),
 	}
 }
 
@@ -334,16 +420,19 @@ func (s *sharedPullerState) AvailableUpdated() time.Time {
 }
 
 // Available returns blocks available in the current temporary file
-func (s *sharedPullerState) Available() []int32 {
+func (s *sharedPullerState) Available() []int {
 	s.mut.RLock()
 	blocks := s.available
 	s.mut.RUnlock()
 	return blocks
 }
 
-func blocksToSize(size int, num int) int64 {
-	if num < 2 {
-		return int64(size / 2)
+func blocksToSize(blocks, blocksInFile, blockSize int, fileSize int64) int64 {
+	// The last/only block has somewhere between 1 and blockSize bytes. We do
+	// not know whether the smaller block is part of the blocks and use an
+	// estimate assuming a random chance that the small block is contained.
+	if blocksInFile == 0 {
+		return 0
 	}
-	return int64(num-1)*int64(size) + int64(size/2)
+	return int64(blocks)*int64(blockSize) - (int64(blockSize)-fileSize%int64(blockSize))*int64(blocks)/int64(blocksInFile)
 }

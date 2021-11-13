@@ -4,7 +4,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// +build go1.12
+//go:build go1.15 && !noquic
+// +build go1.15,!noquic
 
 package connections
 
@@ -13,7 +14,6 @@ import (
 	"crypto/tls"
 	"net"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +24,7 @@ import (
 	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/stun"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
@@ -35,7 +35,7 @@ func init() {
 }
 
 type quicListener struct {
-	util.ServiceWithError
+	svcutil.ServiceWithError
 	nat atomic.Value
 
 	onAddressesChangedNotifier
@@ -47,6 +47,7 @@ type quicListener struct {
 	factory listenerFactory
 
 	address *url.URL
+	laddr   net.Addr
 	mut     sync.Mutex
 }
 
@@ -79,20 +80,25 @@ func (t *quicListener) OnExternalAddressChanged(address *stun.Host, via string) 
 }
 
 func (t *quicListener) serve(ctx context.Context) error {
-	network := strings.Replace(t.uri.Scheme, "quic", "udp", -1)
+	network := quicNetwork(t.uri)
 
-	packetConn, err := net.ListenPacket(network, t.uri.Host)
+	udpAddr, err := net.ResolveUDPAddr(network, t.uri.Host)
 	if err != nil {
 		l.Infoln("Listen (BEP/quic):", err)
 		return err
 	}
-	defer func() { _ = packetConn.Close() }()
 
-	svc, conn := stun.New(t.cfg, t, packetConn)
-	defer func() { _ = conn.Close() }()
+	udpConn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		l.Infoln("Listen (BEP/quic):", err)
+		return err
+	}
+	defer func() { _ = udpConn.Close() }()
 
-	go svc.Serve()
-	defer svc.Stop()
+	svc, conn := stun.New(t.cfg, t, udpConn)
+	defer conn.Close()
+
+	go svc.Serve(ctx)
 
 	registry.Register(t.uri.Scheme, conn)
 	defer registry.Unregister(t.uri.Scheme, conn)
@@ -104,8 +110,20 @@ func (t *quicListener) serve(ctx context.Context) error {
 	}
 	defer listener.Close()
 
-	l.Infof("QUIC listener (%v) starting", packetConn.LocalAddr())
-	defer l.Infof("QUIC listener (%v) shutting down", packetConn.LocalAddr())
+	t.notifyAddressesChanged(t)
+	defer t.clearAddresses(t)
+
+	l.Infof("QUIC listener (%v) starting", udpConn.LocalAddr())
+	defer l.Infof("QUIC listener (%v) shutting down", udpConn.LocalAddr())
+
+	t.mut.Lock()
+	t.laddr = udpConn.LocalAddr()
+	t.mut.Unlock()
+	defer func() {
+		t.mut.Lock()
+		t.laddr = nil
+		t.mut.Unlock()
+	}()
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
@@ -113,7 +131,7 @@ func (t *quicListener) serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		default:
 		}
 
@@ -145,11 +163,11 @@ func (t *quicListener) serve(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			l.Debugf("failed to accept stream from %s: %v", session.RemoteAddr(), err)
-			_ = session.Close()
+			_ = session.CloseWithError(1, err.Error())
 			continue
 		}
 
-		t.conns <- internalConn{&quicTlsConn{session, stream, nil}, connTypeQUICServer, quicPriority}
+		t.conns <- newInternalConn(&quicTlsConn{session, stream, nil}, connTypeQUICServer, quicPriority)
 	}
 }
 
@@ -158,8 +176,8 @@ func (t *quicListener) URI() *url.URL {
 }
 
 func (t *quicListener) WANAddresses() []*url.URL {
-	uris := t.LANAddresses()
 	t.mut.Lock()
+	uris := []*url.URL{maybeReplacePort(t.uri, t.laddr)}
 	if t.address != nil {
 		uris = append(uris, t.address)
 	}
@@ -168,7 +186,13 @@ func (t *quicListener) WANAddresses() []*url.URL {
 }
 
 func (t *quicListener) LANAddresses() []*url.URL {
-	return []*url.URL{t.uri}
+	t.mut.Lock()
+	uri := maybeReplacePort(t.uri, t.laddr)
+	t.mut.Unlock()
+	addrs := []*url.URL{uri}
+	network := quicNetwork(uri)
+	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(network, uri)...)
+	return addrs
 }
 
 func (t *quicListener) String() string {
@@ -201,7 +225,7 @@ func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.
 		conns:   conns,
 		factory: f,
 	}
-	l.ServiceWithError = util.AsServiceWithError(l.serve, l.String())
+	l.ServiceWithError = svcutil.AsService(l.serve, l.String())
 	l.nat.Store(stun.NATUnknown)
 	return l
 }

@@ -4,12 +4,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build freebsd || openbsd || dragonfly
 // +build freebsd openbsd dragonfly
 
 package ur
 
-import "errors"
-
-func memorySize() (int64, error) {
-	return 0, errors.New("not implemented")
+func memorySize() int64 {
+	return 0
 }

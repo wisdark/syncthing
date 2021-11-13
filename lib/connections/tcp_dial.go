@@ -35,7 +35,7 @@ func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, err := dialer.DialContext(timeoutCtx, uri.Scheme, uri.Host)
+	conn, err := dialer.DialContextReusePort(timeoutCtx, uri.Scheme, uri.Host)
 	if err != nil {
 		return internalConn{}, err
 	}
@@ -57,7 +57,7 @@ func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL)
 		return internalConn{}, err
 	}
 
-	return internalConn{tc, connTypeTCPClient, tcpPriority}, nil
+	return newInternalConn(tc, connTypeTCPClient, tcpPriority), nil
 }
 
 type tcpDialerFactory struct{}

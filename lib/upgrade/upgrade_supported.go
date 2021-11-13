@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build !noupgrade
 // +build !noupgrade
 
 package upgrade
@@ -15,6 +16,7 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -366,10 +368,10 @@ func archiveFileVisitor(dir string, tempFile *string, signature *[]byte, archive
 
 func verifyUpgrade(archiveName, tempName string, sig []byte) error {
 	if tempName == "" {
-		return fmt.Errorf("no upgrade found")
+		return errors.New("no upgrade found")
 	}
 	if sig == nil {
-		return fmt.Errorf("no signature found")
+		return errors.New("no signature found")
 	}
 
 	l.Debugf("checking signature\n%s", sig)

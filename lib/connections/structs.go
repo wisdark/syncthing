@@ -18,32 +18,10 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/stats"
+
+	"github.com/thejerf/suture/v4"
 )
-
-// Connection is what we expose to the outside. It is a protocol.Connection
-// that can be closed and has some metadata.
-type Connection interface {
-	protocol.Connection
-	Type() string
-	Transport() string
-	RemoteAddr() net.Addr
-	Priority() int
-	String() string
-	Crypto() string
-}
-
-// completeConn is the aggregation of an internalConn and the
-// protocol.Connection running on top of it. It implements the Connection
-// interface.
-type completeConn struct {
-	internalConn
-	protocol.Connection
-}
-
-func (c completeConn) Close(err error) {
-	c.Connection.Close(err)
-	c.internalConn.Close()
-}
 
 type tlsConn interface {
 	io.ReadWriteCloser
@@ -58,8 +36,9 @@ type tlsConn interface {
 // came from (type, priority).
 type internalConn struct {
 	tlsConn
-	connType connType
-	priority int
+	connType      connType
+	priority      int
+	establishedAt time.Time
 }
 
 type connType int
@@ -105,12 +84,21 @@ func (t connType) Transport() string {
 	}
 }
 
-func (c internalConn) Close() {
+func newInternalConn(tc tlsConn, connType connType, priority int) internalConn {
+	return internalConn{
+		tlsConn:       tc,
+		connType:      connType,
+		priority:      priority,
+		establishedAt: time.Now().Truncate(time.Second),
+	}
+}
+
+func (c internalConn) Close() error {
 	// *tls.Conn.Close() does more than it says on the tin. Specifically, it
 	// sends a TLS alert message, which might block forever if the
 	// connection is dead and we don't have a deadline set.
 	_ = c.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
-	_ = c.tlsConn.Close()
+	return c.tlsConn.Close()
 }
 
 func (c internalConn) Type() string {
@@ -140,6 +128,10 @@ func (c internalConn) Transport() string {
 		return transport + "4"
 	}
 	return transport + "6"
+}
+
+func (c internalConn) EstablishedAt() time.Time {
+	return c.establishedAt
 }
 
 func (c internalConn) String() string {
@@ -174,9 +166,14 @@ type listenerFactory interface {
 	Valid(config.Configuration) error
 }
 
+type ListenerAddresses struct {
+	URI          *url.URL
+	WANAddresses []*url.URL
+	LANAddresses []*url.URL
+}
+
 type genericListener interface {
-	Serve()
-	Stop()
+	suture.Service
 	URI() *url.URL
 	// A given address can potentially be mutated by the listener.
 	// For example we bind to tcp://0.0.0.0, but that for example might return
@@ -188,7 +185,7 @@ type genericListener interface {
 	WANAddresses() []*url.URL
 	LANAddresses() []*url.URL
 	Error() error
-	OnAddressesChanged(func(genericListener))
+	OnAddressesChanged(func(ListenerAddresses))
 	String() string
 	Factory() listenerFactory
 	NATType() string
@@ -196,21 +193,37 @@ type genericListener interface {
 
 type Model interface {
 	protocol.Model
-	AddConnection(conn Connection, hello protocol.HelloResult)
-	Connection(remoteID protocol.DeviceID) (Connection, bool)
-	OnHello(protocol.DeviceID, net.Addr, protocol.HelloResult) error
+	AddConnection(conn protocol.Connection, hello protocol.Hello)
+	NumConnections() int
+	Connection(remoteID protocol.DeviceID) (protocol.Connection, bool)
+	OnHello(protocol.DeviceID, net.Addr, protocol.Hello) error
 	GetHello(protocol.DeviceID) protocol.HelloIntf
+	DeviceStatistics() (map[protocol.DeviceID]stats.DeviceStatistics, error)
 }
 
 type onAddressesChangedNotifier struct {
-	callbacks []func(genericListener)
+	callbacks []func(ListenerAddresses)
 }
 
-func (o *onAddressesChangedNotifier) OnAddressesChanged(callback func(genericListener)) {
+func (o *onAddressesChangedNotifier) OnAddressesChanged(callback func(ListenerAddresses)) {
 	o.callbacks = append(o.callbacks, callback)
 }
 
 func (o *onAddressesChangedNotifier) notifyAddressesChanged(l genericListener) {
+	o.notifyAddresses(ListenerAddresses{
+		URI:          l.URI(),
+		WANAddresses: l.WANAddresses(),
+		LANAddresses: l.LANAddresses(),
+	})
+}
+
+func (o *onAddressesChangedNotifier) clearAddresses(l genericListener) {
+	o.notifyAddresses(ListenerAddresses{
+		URI: l.URI(),
+	})
+}
+
+func (o *onAddressesChangedNotifier) notifyAddresses(l ListenerAddresses) {
 	for _, callback := range o.callbacks {
 		callback(l)
 	}

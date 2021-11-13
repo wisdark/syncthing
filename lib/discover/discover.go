@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 )
 
 // A Finder provides lookup services of some kind.
@@ -35,11 +35,6 @@ type CacheEntry struct {
 type FinderService interface {
 	Finder
 	suture.Service
-}
-
-type FinderMux interface {
-	Finder
-	ChildStatus() map[string]error
 }
 
 // The AddressLister answers questions about what addresses we are listening

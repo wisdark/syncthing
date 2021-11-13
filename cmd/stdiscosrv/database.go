@@ -4,12 +4,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate go run ../../script/protofmt.go database.proto
+//go:generate go run ../../proto/scripts/protofmt.go database.proto
 //go:generate protoc -I ../../ -I . --gogofast_out=. database.proto
 
 package main
 
 import (
+	"context"
 	"log"
 	"sort"
 	"time"
@@ -37,7 +38,6 @@ type database interface {
 type levelDBStore struct {
 	db         *leveldb.DB
 	inbox      chan func()
-	stop       chan struct{}
 	clock      clock
 	marshalBuf []byte
 }
@@ -50,7 +50,6 @@ func newLevelDBStore(dir string) (*levelDBStore, error) {
 	return &levelDBStore{
 		db:    db,
 		inbox: make(chan func(), 16),
-		stop:  make(chan struct{}),
 		clock: defaultClock{},
 	}, nil
 }
@@ -155,7 +154,7 @@ func (s *levelDBStore) get(key string) (DatabaseRecord, error) {
 	return rec, nil
 }
 
-func (s *levelDBStore) Serve() {
+func (s *levelDBStore) Serve(ctx context.Context) error {
 	t := time.NewTimer(0)
 	defer t.Stop()
 	defer s.db.Close()
@@ -183,7 +182,7 @@ loop:
 			// the next.
 			t.Reset(databaseStatisticsInterval)
 
-		case <-s.stop:
+		case <-ctx.Done():
 			// We're done.
 			close(statisticsTrigger)
 			break loop
@@ -192,6 +191,8 @@ loop:
 
 	// Also wait for statisticsServe to return
 	<-statisticsDone
+
+	return nil
 }
 
 func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- struct{}) {
@@ -253,10 +254,6 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 		// Signal that we are done and can be scheduled again.
 		done <- struct{}{}
 	}
-}
-
-func (s *levelDBStore) Stop() {
-	close(s.stop)
 }
 
 // merge returns the merged result of the two database records a and b. The

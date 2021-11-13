@@ -10,10 +10,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"html/template"
 	"io"
 	"io/ioutil"
@@ -23,13 +20,16 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
-	"github.com/lib/pq"
-	geoip2 "github.com/oschwald/geoip2-golang"
+	"github.com/oschwald/geoip2-golang"
+
+	"github.com/syncthing/syncthing/lib/upgrade"
+	"github.com/syncthing/syncthing/lib/ur/contract"
 )
 
 var (
@@ -55,7 +55,8 @@ var (
 		{regexp.MustCompile("jenkins@build.syncthing.net"), "GitHub"},
 		{regexp.MustCompile("snap@build.syncthing.net"), "Snapcraft"},
 		{regexp.MustCompile("android-.*vagrant@basebox-stretch64"), "F-Droid"},
-		{regexp.MustCompile("builduser@svetlemodry"), "Arch (3rd party)"},
+		{regexp.MustCompile("builduser@(archlinux|svetlemodry)"), "Arch (3rd party)"},
+		{regexp.MustCompile("synology@kastelo.net"), "Synology (Kastelo)"},
 		{regexp.MustCompile("@debian"), "Debian (3rd party)"},
 		{regexp.MustCompile("@fedora"), "Fedora (3rd party)"},
 		{regexp.MustCompile(`\bbrew@`), "Homebrew (3rd party)"},
@@ -88,7 +89,7 @@ var funcs = map[string]interface{}{
 			parts = append(parts, part)
 		}
 		if len(input) > 0 {
-			parts = append(parts, input[:])
+			parts = append(parts, input)
 		}
 		return parts[whichPart-1]
 	},
@@ -101,585 +102,44 @@ func getEnvDefault(key, def string) string {
 	return def
 }
 
-type IntMap map[string]int
-
-func (p IntMap) Value() (driver.Value, error) {
-	return json.Marshal(p)
-}
-
-func (p *IntMap) Scan(src interface{}) error {
-	source, ok := src.([]byte)
-	if !ok {
-		return errors.New("Type assertion .([]byte) failed.")
-	}
-
-	var i map[string]int
-	err := json.Unmarshal(source, &i)
-	if err != nil {
-		return err
-	}
-
-	*p = i
-	return nil
-}
-
-type report struct {
-	Received time.Time // Only from DB
-
-	UniqueID       string
-	Version        string
-	LongVersion    string
-	Platform       string
-	NumFolders     int
-	NumDevices     int
-	TotFiles       int
-	FolderMaxFiles int
-	TotMiB         int
-	FolderMaxMiB   int
-	MemoryUsageMiB int
-	SHA256Perf     float64
-	MemorySize     int
-
-	// v2 fields
-
-	URVersion  int
-	NumCPU     int
-	FolderUses struct {
-		SendOnly            int
-		ReceiveOnly         int
-		IgnorePerms         int
-		IgnoreDelete        int
-		AutoNormalize       int
-		SimpleVersioning    int
-		ExternalVersioning  int
-		StaggeredVersioning int
-		TrashcanVersioning  int
-	}
-	DeviceUses struct {
-		Introducer       int
-		CustomCertName   int
-		CompressAlways   int
-		CompressMetadata int
-		CompressNever    int
-		DynamicAddr      int
-		StaticAddr       int
-	}
-	Announce struct {
-		GlobalEnabled     bool
-		LocalEnabled      bool
-		DefaultServersDNS int
-		DefaultServersIP  int
-		OtherServers      int
-	}
-	Relays struct {
-		Enabled        bool
-		DefaultServers int
-		OtherServers   int
-	}
-	UsesRateLimit        bool
-	UpgradeAllowedManual bool
-	UpgradeAllowedAuto   bool
-
-	// V2.5 fields (fields that were in v2 but never added to the database
-	UpgradeAllowedPre bool
-	RescanIntvs       pq.Int64Array
-
-	// v3 fields
-
-	Uptime                     int
-	NATType                    string
-	AlwaysLocalNets            bool
-	CacheIgnoredFiles          bool
-	OverwriteRemoteDeviceNames bool
-	ProgressEmitterEnabled     bool
-	CustomDefaultFolderPath    bool
-	WeakHashSelection          string
-	CustomTrafficClass         bool
-	CustomTempIndexMinBlocks   bool
-	TemporariesDisabled        bool
-	TemporariesCustom          bool
-	LimitBandwidthInLan        bool
-	CustomReleaseURL           bool
-	RestartOnWakeup            bool
-	CustomStunServers          bool
-
-	FolderUsesV3 struct {
-		ScanProgressDisabled    int
-		ConflictsDisabled       int
-		ConflictsUnlimited      int
-		ConflictsOther          int
-		DisableSparseFiles      int
-		DisableTempIndexes      int
-		AlwaysWeakHash          int
-		CustomWeakHashThreshold int
-		FsWatcherEnabled        int
-		PullOrder               IntMap
-		FilesystemType          IntMap
-		FsWatcherDelays         pq.Int64Array
-	}
-
-	GUIStats struct {
-		Enabled                   int
-		UseTLS                    int
-		UseAuth                   int
-		InsecureAdminAccess       int
-		Debugging                 int
-		InsecureSkipHostCheck     int
-		InsecureAllowFrameLoading int
-		ListenLocal               int
-		ListenUnspecified         int
-		Theme                     IntMap
-	}
-
-	BlockStats struct {
-		Total             int
-		Renamed           int
-		Reused            int
-		Pulled            int
-		CopyOrigin        int
-		CopyOriginShifted int
-		CopyElsewhere     int
-	}
-
-	TransportStats IntMap
-
-	IgnoreStats struct {
-		Lines           int
-		Inverts         int
-		Folded          int
-		Deletable       int
-		Rooted          int
-		Includes        int
-		EscapedIncludes int
-		DoubleStars     int
-		Stars           int
-	}
-
-	// V3 fields added late in the RC
-	WeakHashEnabled bool
-
-	// Generated
-
-	Date    string
-	Address string
-}
-
-func (r *report) Validate() error {
-	if r.UniqueID == "" || r.Version == "" || r.Platform == "" {
-		return fmt.Errorf("missing required field")
-	}
-	if len(r.Date) != 8 {
-		return fmt.Errorf("date not initialized")
-	}
-
-	// Some fields may not be null.
-	if r.RescanIntvs == nil {
-		r.RescanIntvs = []int64{}
-	}
-	if r.FolderUsesV3.FsWatcherDelays == nil {
-		r.FolderUsesV3.FsWatcherDelays = []int64{}
-	}
-
-	return nil
-}
-
-func (r *report) FieldPointers() []interface{} {
-	// All the fields of the report, in the same order as the database fields.
-	return []interface{}{
-		&r.Received, &r.UniqueID, &r.Version, &r.LongVersion, &r.Platform,
-		&r.NumFolders, &r.NumDevices, &r.TotFiles, &r.FolderMaxFiles,
-		&r.TotMiB, &r.FolderMaxMiB, &r.MemoryUsageMiB, &r.SHA256Perf,
-		&r.MemorySize, &r.Date,
-		// V2
-		&r.URVersion, &r.NumCPU, &r.FolderUses.SendOnly, &r.FolderUses.IgnorePerms,
-		&r.FolderUses.IgnoreDelete, &r.FolderUses.AutoNormalize, &r.DeviceUses.Introducer,
-		&r.DeviceUses.CustomCertName, &r.DeviceUses.CompressAlways,
-		&r.DeviceUses.CompressMetadata, &r.DeviceUses.CompressNever,
-		&r.DeviceUses.DynamicAddr, &r.DeviceUses.StaticAddr,
-		&r.Announce.GlobalEnabled, &r.Announce.LocalEnabled,
-		&r.Announce.DefaultServersDNS, &r.Announce.DefaultServersIP,
-		&r.Announce.OtherServers, &r.Relays.Enabled, &r.Relays.DefaultServers,
-		&r.Relays.OtherServers, &r.UsesRateLimit, &r.UpgradeAllowedManual,
-		&r.UpgradeAllowedAuto, &r.FolderUses.SimpleVersioning,
-		&r.FolderUses.ExternalVersioning, &r.FolderUses.StaggeredVersioning,
-		&r.FolderUses.TrashcanVersioning,
-
-		// V2.5
-		&r.UpgradeAllowedPre, &r.RescanIntvs,
-
-		// V3
-		&r.Uptime, &r.NATType, &r.AlwaysLocalNets, &r.CacheIgnoredFiles,
-		&r.OverwriteRemoteDeviceNames, &r.ProgressEmitterEnabled, &r.CustomDefaultFolderPath,
-		&r.WeakHashSelection, &r.CustomTrafficClass, &r.CustomTempIndexMinBlocks,
-		&r.TemporariesDisabled, &r.TemporariesCustom, &r.LimitBandwidthInLan,
-		&r.CustomReleaseURL, &r.RestartOnWakeup, &r.CustomStunServers,
-
-		&r.FolderUsesV3.ScanProgressDisabled, &r.FolderUsesV3.ConflictsDisabled,
-		&r.FolderUsesV3.ConflictsUnlimited, &r.FolderUsesV3.ConflictsOther,
-		&r.FolderUsesV3.DisableSparseFiles, &r.FolderUsesV3.DisableTempIndexes,
-		&r.FolderUsesV3.AlwaysWeakHash, &r.FolderUsesV3.CustomWeakHashThreshold,
-		&r.FolderUsesV3.FsWatcherEnabled,
-
-		&r.FolderUsesV3.PullOrder, &r.FolderUsesV3.FilesystemType,
-		&r.FolderUsesV3.FsWatcherDelays,
-
-		&r.GUIStats.Enabled, &r.GUIStats.UseTLS, &r.GUIStats.UseAuth,
-		&r.GUIStats.InsecureAdminAccess,
-		&r.GUIStats.Debugging, &r.GUIStats.InsecureSkipHostCheck,
-		&r.GUIStats.InsecureAllowFrameLoading, &r.GUIStats.ListenLocal,
-		&r.GUIStats.ListenUnspecified, &r.GUIStats.Theme,
-
-		&r.BlockStats.Total, &r.BlockStats.Renamed,
-		&r.BlockStats.Reused, &r.BlockStats.Pulled, &r.BlockStats.CopyOrigin,
-		&r.BlockStats.CopyOriginShifted, &r.BlockStats.CopyElsewhere,
-
-		&r.TransportStats,
-
-		&r.IgnoreStats.Lines, &r.IgnoreStats.Inverts, &r.IgnoreStats.Folded,
-		&r.IgnoreStats.Deletable, &r.IgnoreStats.Rooted, &r.IgnoreStats.Includes,
-		&r.IgnoreStats.EscapedIncludes, &r.IgnoreStats.DoubleStars, &r.IgnoreStats.Stars,
-
-		// V3 added late in the RC
-		&r.WeakHashEnabled,
-		&r.Address,
-
-		// Receive only folders
-		&r.FolderUses.ReceiveOnly,
-	}
-}
-
-func (r *report) FieldNames() []string {
-	// The database fields that back this struct in PostgreSQL
-	return []string{
-		// V1
-		"Received",
-		"UniqueID",
-		"Version",
-		"LongVersion",
-		"Platform",
-		"NumFolders",
-		"NumDevices",
-		"TotFiles",
-		"FolderMaxFiles",
-		"TotMiB",
-		"FolderMaxMiB",
-		"MemoryUsageMiB",
-		"SHA256Perf",
-		"MemorySize",
-		"Date",
-		// V2
-		"ReportVersion",
-		"NumCPU",
-		"FolderRO",
-		"FolderIgnorePerms",
-		"FolderIgnoreDelete",
-		"FolderAutoNormalize",
-		"DeviceIntroducer",
-		"DeviceCustomCertName",
-		"DeviceCompressAlways",
-		"DeviceCompressMetadata",
-		"DeviceCompressNever",
-		"DeviceDynamicAddr",
-		"DeviceStaticAddr",
-		"AnnounceGlobalEnabled",
-		"AnnounceLocalEnabled",
-		"AnnounceDefaultServersDNS",
-		"AnnounceDefaultServersIP",
-		"AnnounceOtherServers",
-		"RelayEnabled",
-		"RelayDefaultServers",
-		"RelayOtherServers",
-		"RateLimitEnabled",
-		"UpgradeAllowedManual",
-		"UpgradeAllowedAuto",
-		// v0.12.19+
-		"FolderSimpleVersioning",
-		"FolderExternalVersioning",
-		"FolderStaggeredVersioning",
-		"FolderTrashcanVersioning",
-		// V2.5
-		"UpgradeAllowedPre",
-		"RescanIntvs",
-		// V3
-		"Uptime",
-		"NATType",
-		"AlwaysLocalNets",
-		"CacheIgnoredFiles",
-		"OverwriteRemoteDeviceNames",
-		"ProgressEmitterEnabled",
-		"CustomDefaultFolderPath",
-		"WeakHashSelection",
-		"CustomTrafficClass",
-		"CustomTempIndexMinBlocks",
-		"TemporariesDisabled",
-		"TemporariesCustom",
-		"LimitBandwidthInLan",
-		"CustomReleaseURL",
-		"RestartOnWakeup",
-		"CustomStunServers",
-
-		"FolderScanProgressDisabled",
-		"FolderConflictsDisabled",
-		"FolderConflictsUnlimited",
-		"FolderConflictsOther",
-		"FolderDisableSparseFiles",
-		"FolderDisableTempIndexes",
-		"FolderAlwaysWeakHash",
-		"FolderCustomWeakHashThreshold",
-		"FolderFsWatcherEnabled",
-		"FolderPullOrder",
-		"FolderFilesystemType",
-		"FolderFsWatcherDelays",
-
-		"GUIEnabled",
-		"GUIUseTLS",
-		"GUIUseAuth",
-		"GUIInsecureAdminAccess",
-		"GUIDebugging",
-		"GUIInsecureSkipHostCheck",
-		"GUIInsecureAllowFrameLoading",
-		"GUIListenLocal",
-		"GUIListenUnspecified",
-		"GUITheme",
-
-		"BlocksTotal",
-		"BlocksRenamed",
-		"BlocksReused",
-		"BlocksPulled",
-		"BlocksCopyOrigin",
-		"BlocksCopyOriginShifted",
-		"BlocksCopyElsewhere",
-
-		"Transport",
-
-		"IgnoreLines",
-		"IgnoreInverts",
-		"IgnoreFolded",
-		"IgnoreDeletable",
-		"IgnoreRooted",
-		"IgnoreIncludes",
-		"IgnoreEscapedIncludes",
-		"IgnoreDoubleStars",
-		"IgnoreStars",
-
-		// V3 added late in the RC
-		"WeakHashEnabled",
-		"Address",
-
-		// Receive only folders
-		"FolderRecvOnly",
-	}
-}
-
 func setupDB(db *sql.DB) error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS Reports (
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS ReportsJson (
 		Received TIMESTAMP NOT NULL,
-		UniqueID VARCHAR(32) NOT NULL,
-		Version VARCHAR(32) NOT NULL,
-		LongVersion VARCHAR(256) NOT NULL,
-		Platform VARCHAR(32) NOT NULL,
-		NumFolders INTEGER NOT NULL,
-		NumDevices INTEGER NOT NULL,
-		TotFiles INTEGER NOT NULL,
-		FolderMaxFiles INTEGER NOT NULL,
-		TotMiB INTEGER NOT NULL,
-		FolderMaxMiB INTEGER NOT NULL,
-		MemoryUsageMiB INTEGER NOT NULL,
-		SHA256Perf DOUBLE PRECISION NOT NULL,
-		MemorySize INTEGER NOT NULL,
-		Date VARCHAR(8) NOT NULL
+		Report JSONB NOT NULL
 	)`)
 	if err != nil {
 		return err
 	}
 
 	var t string
-	row := db.QueryRow(`SELECT 'UniqueIDIndex'::regclass`)
-	if err := row.Scan(&t); err != nil {
-		if _, err = db.Exec(`CREATE UNIQUE INDEX UniqueIDIndex ON Reports (Date, UniqueID)`); err != nil {
+	if err := db.QueryRow(`SELECT 'UniqueIDJsonIndex'::regclass`).Scan(&t); err != nil {
+		if _, err = db.Exec(`CREATE UNIQUE INDEX UniqueIDJsonIndex ON ReportsJson ((Report->>'date'), (Report->>'uniqueID'))`); err != nil {
 			return err
 		}
 	}
 
-	row = db.QueryRow(`SELECT 'ReceivedIndex'::regclass`)
-	if err := row.Scan(&t); err != nil {
-		if _, err = db.Exec(`CREATE INDEX ReceivedIndex ON Reports (Received)`); err != nil {
+	if err := db.QueryRow(`SELECT 'ReceivedJsonIndex'::regclass`).Scan(&t); err != nil {
+		if _, err = db.Exec(`CREATE INDEX ReceivedJsonIndex ON ReportsJson (Received)`); err != nil {
 			return err
 		}
 	}
 
-	// V2
-
-	row = db.QueryRow(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'reports') AND attname = 'reportversion'`)
-	if err := row.Scan(&t); err != nil {
-		// The ReportVersion column doesn't exist; add the new columns.
-		_, err = db.Exec(`ALTER TABLE Reports
-		ADD COLUMN ReportVersion INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN NumCPU INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderRO  INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderIgnorePerms INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderIgnoreDelete INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderAutoNormalize INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceIntroducer INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceCustomCertName INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceCompressAlways INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceCompressMetadata INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceCompressNever INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceDynamicAddr INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN DeviceStaticAddr INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN AnnounceGlobalEnabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN AnnounceLocalEnabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN AnnounceDefaultServersDNS INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN AnnounceDefaultServersIP INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN AnnounceOtherServers INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN RelayEnabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN RelayDefaultServers INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN RelayOtherServers INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN RateLimitEnabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN UpgradeAllowedManual BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN UpgradeAllowedAuto BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN FolderSimpleVersioning INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderExternalVersioning INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderStaggeredVersioning INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderTrashcanVersioning INTEGER NOT NULL DEFAULT 0
-		`)
-		if err != nil {
+	if err := db.QueryRow(`SELECT 'ReportVersionJsonIndex'::regclass`).Scan(&t); err != nil {
+		if _, err = db.Exec(`CREATE INDEX ReportVersionJsonIndex ON ReportsJson (cast((Report->>'urVersion') as numeric))`); err != nil {
 			return err
 		}
 	}
 
-	row = db.QueryRow(`SELECT 'ReportVersionIndex'::regclass`)
-	if err := row.Scan(&t); err != nil {
-		if _, err = db.Exec(`CREATE INDEX ReportVersionIndex ON Reports (ReportVersion)`); err != nil {
-			return err
-		}
-	}
-
-	// V2.5
-
-	row = db.QueryRow(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'reports') AND attname = 'upgradeallowedpre'`)
-	if err := row.Scan(&t); err != nil {
-		// The ReportVersion column doesn't exist; add the new columns.
-		_, err = db.Exec(`ALTER TABLE Reports
-		ADD COLUMN UpgradeAllowedPre BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN RescanIntvs INT[] NOT NULL DEFAULT '{}'
-		`)
-		if err != nil {
-			return err
-		}
-	}
-
-	// V3
-
-	row = db.QueryRow(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'reports') AND attname = 'uptime'`)
-	if err := row.Scan(&t); err != nil {
-		// The Uptime column doesn't exist; add the new columns.
-		_, err = db.Exec(`ALTER TABLE Reports
-		ADD COLUMN Uptime INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN NATType VARCHAR(32) NOT NULL DEFAULT '',
-		ADD COLUMN AlwaysLocalNets BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN CacheIgnoredFiles BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN OverwriteRemoteDeviceNames BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN ProgressEmitterEnabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN CustomDefaultFolderPath BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN WeakHashSelection VARCHAR(32) NOT NULL DEFAULT '',
-		ADD COLUMN CustomTrafficClass BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN CustomTempIndexMinBlocks BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN TemporariesDisabled BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN TemporariesCustom BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN LimitBandwidthInLan BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN CustomReleaseURL BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN RestartOnWakeup BOOLEAN NOT NULL DEFAULT FALSE,
-		ADD COLUMN CustomStunServers BOOLEAN NOT NULL DEFAULT FALSE,
-
-		ADD COLUMN FolderScanProgressDisabled INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderConflictsDisabled INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderConflictsUnlimited INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderConflictsOther INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderDisableSparseFiles INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderDisableTempIndexes INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderAlwaysWeakHash INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderCustomWeakHashThreshold INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderFsWatcherEnabled INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN FolderPullOrder JSONB NOT NULL DEFAULT '{}',
-		ADD COLUMN FolderFilesystemType JSONB NOT NULL DEFAULT '{}',
-		ADD COLUMN FolderFsWatcherDelays INT[] NOT NULL DEFAULT '{}',
-
-		ADD COLUMN GUIEnabled INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIUseTLS INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIUseAuth INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIInsecureAdminAccess INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIDebugging INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIInsecureSkipHostCheck INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIInsecureAllowFrameLoading INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIListenLocal INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUIListenUnspecified INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN GUITheme JSONB NOT NULL DEFAULT '{}',
-
-		ADD COLUMN BlocksTotal INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksRenamed INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksReused INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksPulled INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksCopyOrigin INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksCopyOriginShifted INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN BlocksCopyElsewhere INTEGER NOT NULL DEFAULT 0,
-
-		ADD COLUMN Transport JSONB NOT NULL DEFAULT '{}',
-
-		ADD COLUMN IgnoreLines INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreInverts INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreFolded INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreDeletable INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreRooted INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreIncludes INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreEscapedIncludes INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreDoubleStars INTEGER NOT NULL DEFAULT 0,
-		ADD COLUMN IgnoreStars INTEGER NOT NULL DEFAULT 0
-		`)
-		if err != nil {
-			return err
-		}
-	}
-
-	// V3 added late in the RC
-
-	row = db.QueryRow(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'reports') AND attname = 'weakhashenabled'`)
-	if err := row.Scan(&t); err != nil {
-		// The WeakHashEnabled column doesn't exist; add the new columns.
-		_, err = db.Exec(`ALTER TABLE Reports
-		ADD COLUMN WeakHashEnabled BOOLEAN NOT NULL DEFAULT FALSE
-		ADD COLUMN Address VARCHAR(45) NOT NULL DEFAULT ''
-		`)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Receive only added ad-hoc
-
-	row = db.QueryRow(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'reports') AND attname = 'folderrecvonly'`)
-	if err := row.Scan(&t); err != nil {
-		// The RecvOnly column doesn't exist; add it.
-		_, err = db.Exec(`ALTER TABLE Reports
-		ADD COLUMN FolderRecvOnly INTEGER NOT NULL DEFAULT 0
-		`)
-		if err != nil {
-			return err
-		}
+	// Migrate from old schema to new schema if the table exists.
+	if err := migrate(db); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func insertReport(db *sql.DB, r report) error {
-	r.Received = time.Now().UTC()
-	fields := r.FieldPointers()
-	params := make([]string, len(fields))
-	for i := range params {
-		params[i] = fmt.Sprintf("$%d", i+1)
-	}
-	query := "INSERT INTO Reports (" + strings.Join(r.FieldNames(), ", ") + ") VALUES (" + strings.Join(params, ", ") + ")"
-	_, err := db.Exec(query, fields...)
+func insertReport(db *sql.DB, r contract.Report) error {
+	_, err := db.Exec("INSERT INTO ReportsJson (Report, Received) VALUES ($1, $2)", r, time.Now().UTC())
 
 	return err
 }
@@ -687,9 +147,9 @@ func insertReport(db *sql.DB, r report) error {
 type withDBFunc func(*sql.DB, http.ResponseWriter, *http.Request)
 
 func withDB(db *sql.DB, f withDBFunc) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		f(db, w, r)
-	})
+	}
 }
 
 func main() {
@@ -753,6 +213,7 @@ func main() {
 	http.HandleFunc("/movement.json", withDB(db, movementHandler))
 	http.HandleFunc("/performance.json", withDB(db, performanceHandler))
 	http.HandleFunc("/blockstats.json", withDB(db, blockStatsHandler))
+	http.HandleFunc("/locations.json", withDB(db, locationsHandler))
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 
 	go cacheRefresher(db)
@@ -764,9 +225,10 @@ func main() {
 }
 
 var (
-	cacheData []byte
-	cacheTime time.Time
-	cacheMut  sync.Mutex
+	cachedIndex     []byte
+	cachedLocations []byte
+	cacheTime       time.Time
+	cacheMut        sync.Mutex
 )
 
 const maxCacheTime = 15 * time.Minute
@@ -774,7 +236,7 @@ const maxCacheTime = 15 * time.Minute
 func cacheRefresher(db *sql.DB) {
 	ticker := time.NewTicker(maxCacheTime - time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
+	for ; true; <-ticker.C {
 		cacheMut.Lock()
 		if err := refreshCacheLocked(db); err != nil {
 			log.Println(err)
@@ -790,8 +252,15 @@ func refreshCacheLocked(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	cacheData = buf.Bytes()
+	cachedIndex = buf.Bytes()
 	cacheTime = time.Now()
+
+	locs := rep["locations"].(map[location]int)
+	wlocs := make([]weightedLocation, 0, len(locs))
+	for loc, w := range locs {
+		wlocs = append(wlocs, weightedLocation{loc, w})
+	}
+	cachedLocations, _ = json.Marshal(wlocs)
 	return nil
 }
 
@@ -809,11 +278,27 @@ func rootHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(cacheData)
+		w.Write(cachedIndex)
 	} else {
 		http.Error(w, "Not found", 404)
 		return
 	}
+}
+
+func locationsHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+	cacheMut.Lock()
+	defer cacheMut.Unlock()
+
+	if time.Since(cacheTime) > maxCacheTime {
+		if err := refreshCacheLocked(db); err != nil {
+			log.Println(err)
+			http.Error(w, "Template Error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Write(cachedLocations)
 }
 
 func newDataHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -834,7 +319,7 @@ func newDataHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		addr = ""
 	}
 
-	var rep report
+	var rep contract.Report
 	rep.Date = time.Now().UTC().Format("20060102")
 	rep.Address = addr
 
@@ -859,7 +344,7 @@ func newDataHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := insertReport(db, rep); err != nil {
-		if err.Error() == `pq: duplicate key value violates unique constraint "uniqueidindex"` {
+		if err.Error() == `pq: duplicate key value violates unique constraint "uniqueidjsonindex"` {
 			// We already have a report today for the same unique ID; drop
 			// this one without complaining.
 			return
@@ -874,7 +359,8 @@ func newDataHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 }
 
 func summaryHandler(db *sql.DB, w http.ResponseWriter, r *http.Request) {
-	s, err := getSummary(db)
+	min, _ := strconv.Atoi(r.URL.Query().Get("min"))
+	s, err := getSummary(db, min)
 	if err != nil {
 		log.Println("summaryHandler:", err)
 		http.Error(w, "Database Error", http.StatusInternalServerError)
@@ -1015,8 +501,13 @@ func inc(storage map[string]int, key string, i interface{}) {
 }
 
 type location struct {
-	Latitude  float64
-	Longitude float64
+	Latitude  float64 `json:"lat"`
+	Longitude float64 `json:"lon"`
+}
+
+type weightedLocation struct {
+	location
+	Weight int `json:"weight"`
 }
 
 func getReport(db *sql.DB) map[string]interface{} {
@@ -1036,11 +527,11 @@ func getReport(db *sql.DB) map[string]interface{} {
 	var numDevices []int
 	var totFiles []int
 	var maxFiles []int
-	var totMiB []int
-	var maxMiB []int
-	var memoryUsage []int
+	var totMiB []int64
+	var maxMiB []int64
+	var memoryUsage []int64
 	var sha256Perf []float64
-	var memorySize []int
+	var memorySize []int64
 	var uptime []int
 	var compilers []string
 	var builders []string
@@ -1079,9 +570,9 @@ func getReport(db *sql.DB) map[string]interface{} {
 
 	var numCPU []int
 
-	var rep report
+	var rep contract.Report
 
-	rows, err := db.Query(`SELECT ` + strings.Join(rep.FieldNames(), ",") + ` FROM Reports WHERE Received > now() - '1 day'::INTERVAL`)
+	rows, err := db.Query(`SELECT Received, Report FROM ReportsJson WHERE Received > now() - '1 day'::INTERVAL`)
 	if err != nil {
 		log.Println("sql:", err)
 		return nil
@@ -1089,7 +580,7 @@ func getReport(db *sql.DB) map[string]interface{} {
 	defer rows.Close()
 
 	for rows.Next() {
-		err := rows.Scan(rep.FieldPointers()...)
+		err := rows.Scan(&rep.Received, &rep)
 
 		if err != nil {
 			log.Println("sql:", err)
@@ -1140,19 +631,19 @@ func getReport(db *sql.DB) map[string]interface{} {
 			maxFiles = append(maxFiles, rep.FolderMaxFiles)
 		}
 		if rep.TotMiB > 0 {
-			totMiB = append(totMiB, rep.TotMiB*(1<<20))
+			totMiB = append(totMiB, int64(rep.TotMiB)*(1<<20))
 		}
 		if rep.FolderMaxMiB > 0 {
-			maxMiB = append(maxMiB, rep.FolderMaxMiB*(1<<20))
+			maxMiB = append(maxMiB, int64(rep.FolderMaxMiB)*(1<<20))
 		}
 		if rep.MemoryUsageMiB > 0 {
-			memoryUsage = append(memoryUsage, rep.MemoryUsageMiB*(1<<20))
+			memoryUsage = append(memoryUsage, int64(rep.MemoryUsageMiB)*(1<<20))
 		}
 		if rep.SHA256Perf > 0 {
 			sha256Perf = append(sha256Perf, rep.SHA256Perf*(1<<20))
 		}
 		if rep.MemorySize > 0 {
-			memorySize = append(memorySize, rep.MemorySize*(1<<20))
+			memorySize = append(memorySize, int64(rep.MemorySize)*(1<<20))
 		}
 		if rep.Uptime > 0 {
 			uptime = append(uptime, rep.Uptime)
@@ -1234,8 +725,8 @@ func getReport(db *sql.DB) map[string]interface{} {
 
 			if rep.NATType != "" {
 				natType := rep.NATType
-				natType = strings.Replace(natType, "unknown", "Unknown", -1)
-				natType = strings.Replace(natType, "Symetric", "Symmetric", -1)
+				natType = strings.ReplaceAll(natType, "unknown", "Unknown")
+				natType = strings.ReplaceAll(natType, "Symetric", "Symmetric")
 				add(featureGroups["Various"]["v3"], "NAT Type", natType, 1)
 			}
 
@@ -1253,6 +744,8 @@ func getReport(db *sql.DB) map[string]interface{} {
 			inc(features["Folder"]["v3"], "Weak hash, always", rep.FolderUsesV3.AlwaysWeakHash)
 			inc(features["Folder"]["v3"], "Weak hash, custom threshold", rep.FolderUsesV3.CustomWeakHashThreshold)
 			inc(features["Folder"]["v3"], "Filesystem watcher", rep.FolderUsesV3.FsWatcherEnabled)
+			inc(features["Folder"]["v3"], "Case sensitive FS", rep.FolderUsesV3.CaseSensitiveFS)
+			inc(features["Folder"]["v3"], "Mode, receive encrypted", rep.FolderUsesV3.ReceiveEncrypted)
 
 			add(featureGroups["Folder"]["v3"], "Conflicts", "Disabled", rep.FolderUsesV3.ConflictsDisabled)
 			add(featureGroups["Folder"]["v3"], "Conflicts", "Unlimited", rep.FolderUsesV3.ConflictsUnlimited)
@@ -1261,6 +754,8 @@ func getReport(db *sql.DB) map[string]interface{} {
 			for key, value := range rep.FolderUsesV3.PullOrder {
 				add(featureGroups["Folder"]["v3"], "Pull Order", prettyCase(key), value)
 			}
+
+			inc(features["Device"]["v3"], "Untrusted", rep.DeviceUsesV3.Untrusted)
 
 			totals["GUI"] += rep.GUIStats.Enabled
 
@@ -1303,14 +798,14 @@ func getReport(db *sql.DB) map[string]interface{} {
 	})
 
 	categories = append(categories, category{
-		Values: statsForInts(totMiB),
+		Values: statsForInt64s(totMiB),
 		Descr:  "Data Managed per Device",
 		Unit:   "B",
 		Type:   NumberBinary,
 	})
 
 	categories = append(categories, category{
-		Values: statsForInts(maxMiB),
+		Values: statsForInt64s(maxMiB),
 		Descr:  "Data in Largest Folder",
 		Unit:   "B",
 		Type:   NumberBinary,
@@ -1327,14 +822,14 @@ func getReport(db *sql.DB) map[string]interface{} {
 	})
 
 	categories = append(categories, category{
-		Values: statsForInts(memoryUsage),
+		Values: statsForInt64s(memoryUsage),
 		Descr:  "Memory Usage",
 		Unit:   "B",
 		Type:   NumberBinary,
 	})
 
 	categories = append(categories, category{
-		Values: statsForInts(memorySize),
+		Values: statsForInt64s(memorySize),
 		Descr:  "System Memory",
 		Unit:   "B",
 		Type:   NumberBinary,
@@ -1419,7 +914,7 @@ func getReport(db *sql.DB) map[string]interface{} {
 	r["platforms"] = group(byPlatform, analyticsFor(platforms, 2000), 10)
 	r["compilers"] = group(byCompiler, analyticsFor(compilers, 2000), 5)
 	r["builders"] = analyticsFor(builders, 12)
-	r["distributions"] = analyticsFor(distributions, 10)
+	r["distributions"] = analyticsFor(distributions, len(knownDistributions))
 	r["featureOrder"] = featureOrder
 	r["locations"] = locations
 	r["contries"] = countryList
@@ -1428,7 +923,7 @@ func getReport(db *sql.DB) map[string]interface{} {
 }
 
 var (
-	plusRe  = regexp.MustCompile(`\+.*$`)
+	plusRe  = regexp.MustCompile(`(\+.*|\.dev\..*)$`)
 	plusStr = "(+dev)"
 )
 
@@ -1487,7 +982,9 @@ func (s *summary) MarshalJSON() ([]byte, error) {
 	for v := range s.versions {
 		versions = append(versions, v)
 	}
-	sort.Strings(versions)
+	sort.Slice(versions, func(a, b int) bool {
+		return upgrade.CompareVersions(versions[a], versions[b]) < 0
+	})
 
 	var filtered []string
 	for _, v := range versions {
@@ -1527,7 +1024,21 @@ func (s *summary) MarshalJSON() ([]byte, error) {
 	return json.Marshal(table)
 }
 
-func getSummary(db *sql.DB) (summary, error) {
+// filter removes versions that never reach the specified min count.
+func (s *summary) filter(min int) {
+	// We cheat and just remove the versions from the "index" and leave the
+	// data points alone. The version index is used to build the table when
+	// we do the serialization, so at that point the data points are
+	// filtered out as well.
+	for ver := range s.versions {
+		if s.max[ver] < min {
+			delete(s.versions, ver)
+			delete(s.max, ver)
+		}
+	}
+}
+
+func getSummary(db *sql.DB, min int) (summary, error) {
 	s := newSummary()
 
 	rows, err := db.Query(`SELECT Day, Version, Count FROM VersionSummary WHERE Day > now() - '2 year'::INTERVAL;`)
@@ -1558,6 +1069,7 @@ func getSummary(db *sql.DB) (summary, error) {
 		s.setCount(day.Format("2006-01-02"), ver, num)
 	}
 
+	s.filter(min)
 	return s, nil
 }
 

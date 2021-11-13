@@ -10,17 +10,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
@@ -77,12 +77,10 @@ func setupFile(filename string, blockNumbers []int) protocol.FileInfo {
 	}
 }
 
-func createFile(t *testing.T, name string, fs fs.Filesystem) protocol.FileInfo {
+func createEmptyFileInfo(t *testing.T, name string, fs fs.Filesystem) protocol.FileInfo {
 	t.Helper()
 
-	f, err := fs.Create(name)
-	must(t, err)
-	f.Close()
+	writeFile(t, fs, name, nil)
 	fi, err := fs.Stat(name)
 	must(t, err)
 	file, err := scanner.CreateFileInfo(fi, name, fs)
@@ -90,41 +88,27 @@ func createFile(t *testing.T, name string, fs fs.Filesystem) protocol.FileInfo {
 	return file
 }
 
-func setupSendReceiveFolder(files ...protocol.FileInfo) (*model, *sendReceiveFolder) {
-	w := createTmpWrapper(defaultCfg)
-	model := newModel(w, myID, "syncthing", "dev", db.NewLowlevel(backend.OpenMemory()), nil)
-	fcfg := testFolderConfigTmp()
-	model.addFolder(fcfg)
-
-	f := &sendReceiveFolder{
-		folder: folder{
-			stateTracker:        newStateTracker("default", model.evLogger),
-			model:               model,
-			fset:                model.folderFiles[fcfg.ID],
-			initialScanFinished: make(chan struct{}),
-			ctx:                 context.TODO(),
-			FolderConfiguration: fcfg,
-		},
-
-		queue:         newJobQueue(),
-		pullErrors:    make(map[string]string),
-		pullErrorsMut: sync.NewMutex(),
-	}
-	f.fs = fs.NewMtimeFS(f.Filesystem(), db.NewNamespacedKV(model.db, "mtime"))
+// Sets up a folder and model, but makes sure the services aren't actually running.
+func setupSendReceiveFolder(t testing.TB, files ...protocol.FileInfo) (*testModel, *sendReceiveFolder, context.CancelFunc) {
+	w, fcfg, wCancel := tmpDefaultWrapper()
+	// Initialise model and stop immediately.
+	model := setupModel(t, w)
+	model.cancel()
+	<-model.stopped
+	f := model.folderRunners[fcfg.ID].(*sendReceiveFolder)
+	f.tempPullErrors = make(map[string]string)
+	f.ctx = context.Background()
 
 	// Update index
 	if files != nil {
 		f.updateLocalsFromScanning(files)
 	}
 
-	// Folders are never actually started, so no initial scan will be done
-	close(f.initialScanFinished)
-
-	return model, f
+	return model, f, wCancel
 }
 
-func cleanupSRFolder(f *sendReceiveFolder, m *model) {
-	m.evLogger.Stop()
+func cleanupSRFolder(f *sendReceiveFolder, m *testModel, wrapperCancel context.CancelFunc) {
+	wrapperCancel()
 	os.Remove(m.cfg.ConfigPath())
 	os.RemoveAll(f.Filesystem().URI())
 }
@@ -144,12 +128,12 @@ func TestHandleFile(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	m, f := setupSendReceiveFolder(existingFile)
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t, existingFile)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 
 	copyChan := make(chan copyBlocksState, 1)
 
-	f.handleFile(requiredFile, f.fset.Snapshot(), copyChan)
+	f.handleFile(requiredFile, fsetSnapshot(t, f.fset), copyChan)
 
 	// Receive the results
 	toCopy := <-copyChan
@@ -186,8 +170,8 @@ func TestHandleFileWithTemp(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	m, f := setupSendReceiveFolder(existingFile)
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t, existingFile)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 
 	if _, err := prepareTmpFile(f.Filesystem()); err != nil {
 		t.Fatal(err)
@@ -195,7 +179,7 @@ func TestHandleFileWithTemp(t *testing.T) {
 
 	copyChan := make(chan copyBlocksState, 1)
 
-	f.handleFile(requiredFile, f.fset.Snapshot(), copyChan)
+	f.handleFile(requiredFile, fsetSnapshot(t, f.fset), copyChan)
 
 	// Receive the results
 	toCopy := <-copyChan
@@ -220,100 +204,111 @@ func TestHandleFileWithTemp(t *testing.T) {
 }
 
 func TestCopierFinder(t *testing.T) {
-	// After diff between required and existing we should:
-	// Copy: 1, 2, 3, 4, 6, 7, 8
-	// Since there is no existing file, nor a temp file
-
-	// After dropping out blocks found locally:
-	// Pull: 1, 5, 6, 8
-
-	tempFile := fs.TempName("file2")
-
-	existingBlocks := []int{0, 2, 3, 4, 0, 0, 7, 0}
-	existingFile := setupFile(fs.TempName("file"), existingBlocks)
-	requiredFile := existingFile
-	requiredFile.Blocks = blocks[1:]
-	requiredFile.Name = "file2"
-
-	m, f := setupSendReceiveFolder(existingFile)
-	defer cleanupSRFolder(f, m)
-
-	if _, err := prepareTmpFile(f.Filesystem()); err != nil {
-		t.Fatal(err)
+	methods := []fs.CopyRangeMethod{fs.CopyRangeMethodStandard, fs.CopyRangeMethodAllWithFallback}
+	if runtime.GOOS == "linux" {
+		methods = append(methods, fs.CopyRangeMethodSendFile)
 	}
+	for _, method := range methods {
+		t.Run(method.String(), func(t *testing.T) {
+			// After diff between required and existing we should:
+			// Copy: 1, 2, 3, 4, 6, 7, 8
+			// Since there is no existing file, nor a temp file
 
-	copyChan := make(chan copyBlocksState)
-	pullChan := make(chan pullBlockState, 4)
-	finisherChan := make(chan *sharedPullerState, 1)
+			// After dropping out blocks found locally:
+			// Pull: 1, 5, 6, 8
 
-	// Run a single fetcher routine
-	go f.copierRoutine(copyChan, pullChan, finisherChan)
-	defer close(copyChan)
+			tempFile := fs.TempName("file2")
 
-	f.handleFile(requiredFile, f.fset.Snapshot(), copyChan)
+			existingBlocks := []int{0, 2, 3, 4, 0, 0, 7, 0}
+			existingFile := setupFile(fs.TempName("file"), existingBlocks)
+			existingFile.Size = 1
+			requiredFile := existingFile
+			requiredFile.Blocks = blocks[1:]
+			requiredFile.Name = "file2"
 
-	timeout := time.After(10 * time.Second)
-	pulls := make([]pullBlockState, 4)
-	for i := 0; i < 4; i++ {
-		select {
-		case pulls[i] = <-pullChan:
-		case <-timeout:
-			t.Fatalf("Timed out before receiving all 4 states on pullChan (already got %v)", i)
-		}
-	}
-	var finish *sharedPullerState
-	select {
-	case finish = <-finisherChan:
-	case <-timeout:
-		t.Fatal("Timed out before receiving 4 states on pullChan")
-	}
+			m, f, wcfgCancel := setupSendReceiveFolder(t, existingFile)
+			f.CopyRangeMethod = method
 
-	defer cleanupSharedPullerState(finish)
+			defer cleanupSRFolder(f, m, wcfgCancel)
 
-	select {
-	case <-pullChan:
-		t.Fatal("Pull channel has data to be read")
-	case <-finisherChan:
-		t.Fatal("Finisher channel has data to be read")
-	default:
-	}
-
-	// Verify that the right blocks went into the pull list.
-	// They are pulled in random order.
-	for _, idx := range []int{1, 5, 6, 8} {
-		found := false
-		block := blocks[idx]
-		for _, pulledBlock := range pulls {
-			if string(pulledBlock.block.Hash) == string(block.Hash) {
-				found = true
-				break
+			if _, err := prepareTmpFile(f.Filesystem()); err != nil {
+				t.Fatal(err)
 			}
-		}
-		if !found {
-			t.Errorf("Did not find block %s", block.String())
-		}
-		if string(finish.file.Blocks[idx-1].Hash) != string(blocks[idx].Hash) {
-			t.Errorf("Block %d mismatch: %s != %s", idx, finish.file.Blocks[idx-1].String(), blocks[idx].String())
-		}
-	}
 
-	// Verify that the fetched blocks have actually been written to the temp file
-	blks, err := scanner.HashFile(context.TODO(), f.Filesystem(), tempFile, protocol.MinBlockSize, nil, false)
-	if err != nil {
-		t.Log(err)
-	}
+			copyChan := make(chan copyBlocksState)
+			pullChan := make(chan pullBlockState, 4)
+			finisherChan := make(chan *sharedPullerState, 1)
 
-	for _, eq := range []int{2, 3, 4, 7} {
-		if string(blks[eq-1].Hash) != string(blocks[eq].Hash) {
-			t.Errorf("Block %d mismatch: %s != %s", eq, blks[eq-1].String(), blocks[eq].String())
-		}
+			// Run a single fetcher routine
+			go f.copierRoutine(copyChan, pullChan, finisherChan)
+			defer close(copyChan)
+
+			f.handleFile(requiredFile, fsetSnapshot(t, f.fset), copyChan)
+
+			timeout := time.After(10 * time.Second)
+			pulls := make([]pullBlockState, 4)
+			for i := 0; i < 4; i++ {
+				select {
+				case pulls[i] = <-pullChan:
+				case <-timeout:
+					t.Fatalf("Timed out before receiving all 4 states on pullChan (already got %v)", i)
+				}
+			}
+			var finish *sharedPullerState
+			select {
+			case finish = <-finisherChan:
+			case <-timeout:
+				t.Fatal("Timed out before receiving 4 states on pullChan")
+			}
+
+			defer cleanupSharedPullerState(finish)
+
+			select {
+			case <-pullChan:
+				t.Fatal("Pull channel has data to be read")
+			case <-finisherChan:
+				t.Fatal("Finisher channel has data to be read")
+			default:
+			}
+
+			// Verify that the right blocks went into the pull list.
+			// They are pulled in random order.
+			for _, idx := range []int{1, 5, 6, 8} {
+				found := false
+				block := blocks[idx]
+				for _, pulledBlock := range pulls {
+					if string(pulledBlock.block.Hash) == string(block.Hash) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Did not find block %s", block.String())
+				}
+				if string(finish.file.Blocks[idx-1].Hash) != string(blocks[idx].Hash) {
+					t.Errorf("Block %d mismatch: %s != %s", idx, finish.file.Blocks[idx-1].String(), blocks[idx].String())
+				}
+			}
+
+			// Verify that the fetched blocks have actually been written to the temp file
+			blks, err := scanner.HashFile(context.TODO(), f.Filesystem(), tempFile, protocol.MinBlockSize, nil, false)
+			if err != nil {
+				t.Log(err)
+			}
+
+			for _, eq := range []int{2, 3, 4, 7} {
+				if string(blks[eq-1].Hash) != string(blocks[eq].Hash) {
+					t.Errorf("Block %d mismatch: %s != %s", eq, blks[eq-1].String(), blocks[eq].String())
+				}
+			}
+		})
 	}
 }
 
 func TestWeakHash(t *testing.T) {
 	// Setup the model/pull environment
-	model, fo := setupSendReceiveFolder()
-	defer cleanupSRFolder(fo, model)
+	model, fo, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(fo, model, wcfgCancel)
 	ffs := fo.Filesystem()
 
 	tempFile := fs.TempName("weakhash")
@@ -361,7 +356,7 @@ func TestWeakHash(t *testing.T) {
 		Blocks:     existing,
 		Size:       size,
 		ModifiedS:  info.ModTime().Unix(),
-		ModifiedNs: int32(info.ModTime().Nanosecond()),
+		ModifiedNs: info.ModTime().Nanosecond(),
 	}
 	desiredFile := protocol.FileInfo{
 		Name:      "weakhash",
@@ -382,7 +377,7 @@ func TestWeakHash(t *testing.T) {
 
 	// Test 1 - no weak hashing, file gets fully repulled (`expectBlocks` pulls).
 	fo.WeakHashThresholdPct = 101
-	fo.handleFile(desiredFile, fo.fset.Snapshot(), copyChan)
+	fo.handleFile(desiredFile, fsetSnapshot(t, fo.fset), copyChan)
 
 	var pulls []pullBlockState
 	timeout := time.After(10 * time.Second)
@@ -391,7 +386,7 @@ func TestWeakHash(t *testing.T) {
 		case pull := <-pullChan:
 			pulls = append(pulls, pull)
 		case <-timeout:
-			t.Errorf("timed out, got %d pulls expected %d", len(pulls), expectPulls)
+			t.Fatalf("timed out, got %d pulls expected %d", len(pulls), expectPulls)
 		}
 	}
 	finish := <-finisherChan
@@ -411,7 +406,7 @@ func TestWeakHash(t *testing.T) {
 
 	// Test 2 - using weak hash, expectPulls blocks pulled.
 	fo.WeakHashThresholdPct = -1
-	fo.handleFile(desiredFile, fo.fset.Snapshot(), copyChan)
+	fo.handleFile(desiredFile, fsetSnapshot(t, fo.fset), copyChan)
 
 	pulls = pulls[:0]
 	for len(pulls) < expectPulls {
@@ -419,7 +414,7 @@ func TestWeakHash(t *testing.T) {
 		case pull := <-pullChan:
 			pulls = append(pulls, pull)
 		case <-time.After(10 * time.Second):
-			t.Errorf("timed out, got %d pulls expected %d", len(pulls), expectPulls)
+			t.Fatalf("timed out, got %d pulls expected %d", len(pulls), expectPulls)
 		}
 	}
 
@@ -440,8 +435,9 @@ func TestCopierCleanup(t *testing.T) {
 
 	// Create a file
 	file := setupFile("test", []int{0})
-	m, f := setupSendReceiveFolder(file)
-	defer cleanupSRFolder(f, m)
+	file.Size = 1
+	m, f, wcfgCancel := setupSendReceiveFolder(t, file)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 
 	file.Blocks = []protocol.BlockInfo{blocks[1]}
 	file.Version = file.Version.Update(myID.Short())
@@ -473,8 +469,8 @@ func TestCopierCleanup(t *testing.T) {
 func TestDeregisterOnFailInCopy(t *testing.T) {
 	file := setupFile("filex", []int{0, 2, 0, 0, 5, 0, 0, 8})
 
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 
 	// Set up our evet subscription early
 	s := m.evLogger.Subscribe(events.ItemFinished)
@@ -488,10 +484,10 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 	}
 
 	pullChan := make(chan pullBlockState)
-	finisherBufferChan := make(chan *sharedPullerState)
+	finisherBufferChan := make(chan *sharedPullerState, 1)
 	finisherChan := make(chan *sharedPullerState)
 	dbUpdateChan := make(chan dbUpdateJob, 1)
-	snap := f.fset.Snapshot()
+	snap := fsetSnapshot(t, f.fset)
 
 	copyChan, copyWg := startCopier(f, pullChan, finisherBufferChan)
 	go f.finisherRoutine(snap, finisherChan, dbUpdateChan, make(chan string))
@@ -508,7 +504,12 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 
 	// Receive a block at puller, to indicate that at least a single copier
 	// loop has been performed.
-	toPull := <-pullChan
+	var toPull pullBlockState
+	select {
+	case toPull = <-pullChan:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out")
+	}
 
 	// Unblock copier
 	go func() {
@@ -568,8 +569,8 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 func TestDeregisterOnFailInPull(t *testing.T) {
 	file := setupFile("filex", []int{0, 2, 0, 0, 5, 0, 0, 8})
 
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 
 	// Set up our evet subscription early
 	s := m.evLogger.Subscribe(events.ItemFinished)
@@ -586,13 +587,13 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 	finisherBufferChan := make(chan *sharedPullerState)
 	finisherChan := make(chan *sharedPullerState)
 	dbUpdateChan := make(chan dbUpdateJob, 1)
-	snap := f.fset.Snapshot()
+	snap := fsetSnapshot(t, f.fset)
 
 	copyChan, copyWg := startCopier(f, pullChan, finisherBufferChan)
 	pullWg := sync.NewWaitGroup()
 	pullWg.Add(1)
 	go func() {
-		f.pullerRoutine(pullChan, finisherBufferChan)
+		f.pullerRoutine(snap, pullChan, finisherBufferChan)
 		pullWg.Done()
 	}()
 	go f.finisherRoutine(snap, finisherChan, dbUpdateChan, make(chan string))
@@ -671,8 +672,8 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 }
 
 func TestIssue3164(t *testing.T) {
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 	ffs := f.Filesystem()
 	tmpDir := ffs.URI()
 
@@ -685,13 +686,15 @@ func TestIssue3164(t *testing.T) {
 		Name: "issue3164",
 	}
 
+	must(t, f.scanSubdirs(nil))
+
 	matcher := ignore.New(ffs)
 	must(t, matcher.Parse(bytes.NewBufferString("(?d)oktodelete"), ""))
 	f.ignores = matcher
 
 	dbUpdateChan := make(chan dbUpdateJob, 1)
 
-	f.deleteDir(file, f.fset.Snapshot(), dbUpdateChan, make(chan string))
+	f.deleteDir(file, fsetSnapshot(t, f.fset), dbUpdateChan, make(chan string))
 
 	if _, err := ffs.Stat("issue3164"); !fs.IsNotExist(err) {
 		t.Fatal(err)
@@ -760,8 +763,8 @@ func TestDiffEmpty(t *testing.T) {
 // option is true and the permissions do not match between the file on disk and
 // in the db.
 func TestDeleteIgnorePerms(t *testing.T) {
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 	ffs := f.Filesystem()
 	f.IgnorePerms = true
 
@@ -777,17 +780,8 @@ func TestDeleteIgnorePerms(t *testing.T) {
 	fi, err := scanner.CreateFileInfo(stat, name, ffs)
 	must(t, err)
 	ffs.Chmod(name, 0600)
-	scanChan := make(chan string)
-	finished := make(chan struct{})
-	go func() {
-		err = f.checkToBeDeleted(fi, scanChan)
-		close(finished)
-	}()
-	select {
-	case <-scanChan:
-		<-finished
-	case <-finished:
-	}
+	scanChan := make(chan string, 1)
+	err = f.checkToBeDeleted(fi, fi, true, scanChan)
 	must(t, err)
 }
 
@@ -807,17 +801,18 @@ func TestCopyOwner(t *testing.T) {
 	// Set up a folder with the CopyParentOwner bit and backed by a fake
 	// filesystem.
 
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
-	f.folder.FolderConfiguration = config.NewFolderConfiguration(m.id, f.ID, f.Label, fs.FilesystemTypeFake, "/TestCopyOwner")
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+	f.folder.FolderConfiguration = newFolderConfiguration(m.cfg, f.ID, f.Label, fs.FilesystemTypeFake, "/TestCopyOwner")
 	f.folder.FolderConfiguration.CopyOwnershipFromParent = true
 
-	f.fs = f.Filesystem()
+	f.fset = newFileSet(t, f.ID, f.Filesystem(), m.db)
+	f.mtimefs = f.fset.MtimeFS()
 
 	// Create a parent dir with a certain owner/group.
 
-	f.fs.Mkdir("foo", 0755)
-	f.fs.Lchown("foo", expOwner, expGroup)
+	f.mtimefs.Mkdir("foo", 0755)
+	f.mtimefs.Lchown("foo", expOwner, expGroup)
 
 	dir := protocol.FileInfo{
 		Name:        "foo/bar",
@@ -829,11 +824,16 @@ func TestCopyOwner(t *testing.T) {
 	// owner/group.
 
 	dbUpdateChan := make(chan dbUpdateJob, 1)
+	scanChan := make(chan string)
 	defer close(dbUpdateChan)
-	f.handleDir(dir, f.fset.Snapshot(), dbUpdateChan, nil)
-	<-dbUpdateChan // empty the channel for later
+	f.handleDir(dir, fsetSnapshot(t, f.fset), dbUpdateChan, scanChan)
+	select {
+	case <-dbUpdateChan: // empty the channel for later
+	case toScan := <-scanChan:
+		t.Fatal("Unexpected receive on scanChan:", toScan)
+	}
 
-	info, err := f.fs.Lstat("foo/bar")
+	info, err := f.mtimefs.Lstat("foo/bar")
 	if err != nil {
 		t.Fatal("Unexpected error (dir):", err)
 	}
@@ -856,7 +856,7 @@ func TestCopyOwner(t *testing.T) {
 	// but it's the way data is passed around. When the database update
 	// comes the finisher is done.
 
-	snap := f.fset.Snapshot()
+	snap := fsetSnapshot(t, f.fset)
 	finisherChan := make(chan *sharedPullerState)
 	copierChan, copyWg := startCopier(f, nil, finisherChan)
 	go f.finisherRoutine(snap, finisherChan, dbUpdateChan, nil)
@@ -869,7 +869,7 @@ func TestCopyOwner(t *testing.T) {
 	f.handleFile(file, snap, copierChan)
 	<-dbUpdateChan
 
-	info, err = f.fs.Lstat("foo/bar/baz")
+	info, err = f.mtimefs.Lstat("foo/bar/baz")
 	if err != nil {
 		t.Fatal("Unexpected error (file):", err)
 	}
@@ -885,10 +885,14 @@ func TestCopyOwner(t *testing.T) {
 		SymlinkTarget: "over the rainbow",
 	}
 
-	f.handleSymlink(symlink, snap, dbUpdateChan, nil)
-	<-dbUpdateChan
+	f.handleSymlink(symlink, snap, dbUpdateChan, scanChan)
+	select {
+	case <-dbUpdateChan:
+	case toScan := <-scanChan:
+		t.Fatal("Unexpected receive on scanChan:", toScan)
+	}
 
-	info, err = f.fs.Lstat("foo/bar/sym")
+	info, err = f.mtimefs.Lstat("foo/bar/sym")
 	if err != nil {
 		t.Fatal("Unexpected error (file):", err)
 	}
@@ -900,14 +904,14 @@ func TestCopyOwner(t *testing.T) {
 // TestSRConflictReplaceFileByDir checks that a conflict is created when an existing file
 // is replaced with a directory and versions are conflicting
 func TestSRConflictReplaceFileByDir(t *testing.T) {
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 	ffs := f.Filesystem()
 
 	name := "foo"
 
 	// create local file
-	file := createFile(t, name, ffs)
+	file := createEmptyFileInfo(t, name, ffs)
 	file.Version = protocol.Vector{}.Update(myID.Short())
 	f.updateLocalsFromScanning([]protocol.FileInfo{file})
 
@@ -920,7 +924,7 @@ func TestSRConflictReplaceFileByDir(t *testing.T) {
 	dbUpdateChan := make(chan dbUpdateJob, 1)
 	scanChan := make(chan string, 1)
 
-	f.handleDir(file, f.fset.Snapshot(), dbUpdateChan, scanChan)
+	f.handleDir(file, fsetSnapshot(t, f.fset), dbUpdateChan, scanChan)
 
 	if confls := existingConflicts(name, ffs); len(confls) != 1 {
 		t.Fatal("Expected one conflict, got", len(confls))
@@ -932,14 +936,14 @@ func TestSRConflictReplaceFileByDir(t *testing.T) {
 // TestSRConflictReplaceFileByLink checks that a conflict is created when an existing file
 // is replaced with a link and versions are conflicting
 func TestSRConflictReplaceFileByLink(t *testing.T) {
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 	ffs := f.Filesystem()
 
 	name := "foo"
 
 	// create local file
-	file := createFile(t, name, ffs)
+	file := createEmptyFileInfo(t, name, ffs)
 	file.Version = protocol.Vector{}.Update(myID.Short())
 	f.updateLocalsFromScanning([]protocol.FileInfo{file})
 
@@ -953,7 +957,7 @@ func TestSRConflictReplaceFileByLink(t *testing.T) {
 	dbUpdateChan := make(chan dbUpdateJob, 1)
 	scanChan := make(chan string, 1)
 
-	f.handleSymlink(file, f.fset.Snapshot(), dbUpdateChan, scanChan)
+	f.handleSymlink(file, fsetSnapshot(t, f.fset), dbUpdateChan, scanChan)
 
 	if confls := existingConflicts(name, ffs); len(confls) != 1 {
 		t.Fatal("Expected one conflict, got", len(confls))
@@ -965,8 +969,8 @@ func TestSRConflictReplaceFileByLink(t *testing.T) {
 // TestDeleteBehindSymlink checks that we don't delete or schedule a scan
 // when trying to delete a file behind a symlink.
 func TestDeleteBehindSymlink(t *testing.T) {
-	m, f := setupSendReceiveFolder()
-	defer cleanupSRFolder(f, m)
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
 	ffs := f.Filesystem()
 
 	destDir := createTmpDir()
@@ -977,12 +981,12 @@ func TestDeleteBehindSymlink(t *testing.T) {
 	file := filepath.Join(link, "file")
 
 	must(t, ffs.MkdirAll(link, 0755))
-	fi := createFile(t, file, ffs)
+	fi := createEmptyFileInfo(t, file, ffs)
 	f.updateLocalsFromScanning([]protocol.FileInfo{fi})
-	must(t, osutil.RenameOrCopy(ffs, destFs, file, "file"))
+	must(t, osutil.RenameOrCopy(fs.CopyRangeMethodStandard, ffs, destFs, file, "file"))
 	must(t, ffs.RemoveAll(link))
 
-	if err := osutil.DebugSymlinkForTestsOnly(destFs.URI(), filepath.Join(ffs.URI(), link)); err != nil {
+	if err := fs.DebugSymlinkForTestsOnly(destFs, ffs, "", link); err != nil {
 		if runtime.GOOS == "windows" {
 			// Probably we require permissions we don't have.
 			t.Skip("Need admin permissions or developer mode to run symlink test on Windows: " + err.Error())
@@ -995,7 +999,7 @@ func TestDeleteBehindSymlink(t *testing.T) {
 	fi.Version = fi.Version.Update(device1.Short())
 	scanChan := make(chan string, 1)
 	dbUpdateChan := make(chan dbUpdateJob, 1)
-	f.deleteFile(fi, f.fset.Snapshot(), dbUpdateChan, scanChan)
+	f.deleteFile(fi, fsetSnapshot(t, f.fset), dbUpdateChan, scanChan)
 	select {
 	case f := <-scanChan:
 		t.Fatalf("Received %v on scanChan", f)
@@ -1011,6 +1015,365 @@ func TestDeleteBehindSymlink(t *testing.T) {
 	}
 	if _, err := destFs.Stat("file"); err != nil {
 		t.Errorf("Expected no error when stating file behind symlink, got %v", err)
+	}
+}
+
+// Reproduces https://github.com/syncthing/syncthing/issues/6559
+func TestPullCtxCancel(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+
+	pullChan := make(chan pullBlockState)
+	finisherChan := make(chan *sharedPullerState)
+
+	var cancel context.CancelFunc
+	f.ctx, cancel = context.WithCancel(context.Background())
+
+	go f.pullerRoutine(fsetSnapshot(t, f.fset), pullChan, finisherChan)
+	defer close(pullChan)
+
+	emptyState := func() pullBlockState {
+		return pullBlockState{
+			sharedPullerState: newSharedPullerState(protocol.FileInfo{}, nil, f.folderID, "", nil, nil, false, false, protocol.FileInfo{}, false, false),
+			block:             protocol.BlockInfo{},
+		}
+	}
+
+	cancel()
+
+	done := make(chan struct{})
+	defer close(done)
+	for i := 0; i < 2; i++ {
+		go func() {
+			select {
+			case pullChan <- emptyState():
+			case <-done:
+			}
+		}()
+		select {
+		case s := <-finisherChan:
+			if s.failed() == nil {
+				t.Errorf("state %v not failed", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out before receiving state %v on finisherChan", i)
+		}
+	}
+}
+
+func TestPullDeleteUnscannedDir(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+	ffs := f.Filesystem()
+
+	dir := "foobar"
+	must(t, ffs.MkdirAll(dir, 0777))
+	fi := protocol.FileInfo{
+		Name: dir,
+	}
+
+	scanChan := make(chan string, 1)
+	dbUpdateChan := make(chan dbUpdateJob, 1)
+
+	f.deleteDir(fi, fsetSnapshot(t, f.fset), dbUpdateChan, scanChan)
+
+	if _, err := ffs.Stat(dir); fs.IsNotExist(err) {
+		t.Error("directory has been deleted")
+	}
+	select {
+	case toScan := <-scanChan:
+		if toScan != dir {
+			t.Errorf("expected %v to be scanned, got %v", dir, toScan)
+		}
+	default:
+		t.Error("nothing was scheduled for scanning")
+	}
+}
+
+func TestPullCaseOnlyPerformFinish(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+	ffs := f.Filesystem()
+
+	name := "foo"
+	contents := []byte("contents")
+	writeFile(t, ffs, name, contents)
+	must(t, f.scanSubdirs(nil))
+
+	var cur protocol.FileInfo
+	hasCur := false
+	snap := dbSnapshot(t, m, f.ID)
+	defer snap.Release()
+	snap.WithHave(protocol.LocalDeviceID, func(i protocol.FileIntf) bool {
+		if hasCur {
+			t.Fatal("got more than one file")
+		}
+		cur = i.(protocol.FileInfo)
+		hasCur = true
+		return true
+	})
+	if !hasCur {
+		t.Fatal("file is missing")
+	}
+
+	remote := *(&cur)
+	remote.Version = protocol.Vector{}.Update(device1.Short())
+	remote.Name = strings.ToUpper(cur.Name)
+	temp := fs.TempName(remote.Name)
+	writeFile(t, ffs, temp, contents)
+	scanChan := make(chan string, 1)
+	dbUpdateChan := make(chan dbUpdateJob, 1)
+
+	err := f.performFinish(remote, cur, hasCur, temp, snap, dbUpdateChan, scanChan)
+
+	select {
+	case <-dbUpdateChan: // boring case sensitive filesystem
+		return
+	case <-scanChan:
+		t.Error("no need to scan anything here")
+	default:
+	}
+
+	var caseErr *fs.ErrCaseConflict
+	if !errors.As(err, &caseErr) {
+		t.Error("Expected case conflict error, got", err)
+	}
+}
+
+func TestPullCaseOnlyDir(t *testing.T) {
+	testPullCaseOnlyDirOrSymlink(t, true)
+}
+
+func TestPullCaseOnlySymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks not supported on windows")
+	}
+	testPullCaseOnlyDirOrSymlink(t, false)
+}
+
+func testPullCaseOnlyDirOrSymlink(t *testing.T, dir bool) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+	ffs := f.Filesystem()
+
+	name := "foo"
+	if dir {
+		must(t, ffs.Mkdir(name, 0777))
+	} else {
+		must(t, ffs.CreateSymlink("target", name))
+	}
+
+	must(t, f.scanSubdirs(nil))
+	var cur protocol.FileInfo
+	hasCur := false
+	snap := dbSnapshot(t, m, f.ID)
+	defer snap.Release()
+	snap.WithHave(protocol.LocalDeviceID, func(i protocol.FileIntf) bool {
+		if hasCur {
+			t.Fatal("got more than one file")
+		}
+		cur = i.(protocol.FileInfo)
+		hasCur = true
+		return true
+	})
+	if !hasCur {
+		t.Fatal("file is missing")
+	}
+
+	scanChan := make(chan string, 1)
+	dbUpdateChan := make(chan dbUpdateJob, 1)
+	remote := *(&cur)
+	remote.Version = protocol.Vector{}.Update(device1.Short())
+	remote.Name = strings.ToUpper(cur.Name)
+
+	if dir {
+		f.handleDir(remote, snap, dbUpdateChan, scanChan)
+	} else {
+		f.handleSymlink(remote, snap, dbUpdateChan, scanChan)
+	}
+
+	select {
+	case <-dbUpdateChan: // boring case sensitive filesystem
+		return
+	case <-scanChan:
+		t.Error("no need to scan anything here")
+	default:
+	}
+	if errStr, ok := f.tempPullErrors[remote.Name]; !ok {
+		t.Error("missing error for", remote.Name)
+	} else if !strings.Contains(errStr, "uses different upper or lowercase") {
+		t.Error("unexpected error", errStr, "for", remote.Name)
+	}
+}
+
+func TestPullTempFileCaseConflict(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+
+	copyChan := make(chan copyBlocksState, 1)
+
+	file := protocol.FileInfo{Name: "foo"}
+	confl := "Foo"
+	tempNameConfl := fs.TempName(confl)
+	if fd, err := f.mtimefs.Create(tempNameConfl); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := fd.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		fd.Close()
+	}
+
+	f.handleFile(file, fsetSnapshot(t, f.fset), copyChan)
+
+	cs := <-copyChan
+	if _, err := cs.tempFile(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestPullCaseOnlyRename(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+
+	// tempNameConfl := fs.TempName(confl)
+
+	name := "foo"
+	if fd, err := f.mtimefs.Create(name); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := fd.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		fd.Close()
+	}
+
+	must(t, f.scanSubdirs(nil))
+
+	cur, ok := m.testCurrentFolderFile(f.ID, name)
+	if !ok {
+		t.Fatal("file missing")
+	}
+
+	deleted := cur
+	deleted.SetDeleted(myID.Short())
+
+	confl := cur
+	confl.Name = "Foo"
+	confl.Version = confl.Version.Update(device1.Short())
+
+	dbUpdateChan := make(chan dbUpdateJob, 2)
+	scanChan := make(chan string, 2)
+	snap := fsetSnapshot(t, f.fset)
+	defer snap.Release()
+	if err := f.renameFile(cur, deleted, confl, snap, dbUpdateChan, scanChan); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestPullSymlinkOverExistingWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip()
+	}
+
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+	addFakeConn(m, device1, f.ID)
+
+	name := "foo"
+	if fd, err := f.mtimefs.Create(name); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := fd.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		fd.Close()
+	}
+
+	must(t, f.scanSubdirs(nil))
+
+	file, ok := m.testCurrentFolderFile(f.ID, name)
+	if !ok {
+		t.Fatal("file missing")
+	}
+	must(t, m.Index(device1, f.ID, []protocol.FileInfo{{Name: name, Type: protocol.FileInfoTypeSymlink, Version: file.Version.Update(device1.Short())}}))
+
+	scanChan := make(chan string)
+
+	changed, err := f.pullerIteration(scanChan)
+	must(t, err)
+	if changed != 1 {
+		t.Error("Expected one change in pull, got", changed)
+	}
+	if file, ok := m.testCurrentFolderFile(f.ID, name); !ok {
+		t.Error("symlink entry missing")
+	} else if !file.IsUnsupported() {
+		t.Error("symlink entry isn't marked as unsupported")
+	}
+	if _, err := f.mtimefs.Lstat(name); err == nil {
+		t.Error("old file still exists on disk")
+	} else if !fs.IsNotExist(err) {
+		t.Error(err)
+	}
+}
+
+func TestPullDeleteCaseConflict(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+
+	name := "foo"
+	fi := protocol.FileInfo{Name: "Foo"}
+	dbUpdateChan := make(chan dbUpdateJob, 1)
+	scanChan := make(chan string)
+
+	if fd, err := f.mtimefs.Create(name); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := fd.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		fd.Close()
+	}
+	f.deleteFileWithCurrent(fi, protocol.FileInfo{}, false, dbUpdateChan, scanChan)
+	select {
+	case <-dbUpdateChan:
+	default:
+		t.Error("Missing db update for file")
+	}
+
+	snap := fsetSnapshot(t, f.fset)
+	defer snap.Release()
+	f.deleteDir(fi, snap, dbUpdateChan, scanChan)
+	select {
+	case <-dbUpdateChan:
+	default:
+		t.Error("Missing db update for dir")
+	}
+}
+
+func TestPullDeleteIgnoreChildDir(t *testing.T) {
+	m, f, wcfgCancel := setupSendReceiveFolder(t)
+	defer cleanupSRFolder(f, m, wcfgCancel)
+
+	parent := "parent"
+	del := "ignored"
+	child := "keep"
+	matcher := ignore.New(f.mtimefs)
+	must(t, matcher.Parse(bytes.NewBufferString(fmt.Sprintf(`
+!%v
+(?d)%v
+`, child, del)), ""))
+	f.ignores = matcher
+
+	must(t, f.mtimefs.Mkdir(parent, 0777))
+	must(t, f.mtimefs.Mkdir(filepath.Join(parent, del), 0777))
+	must(t, f.mtimefs.Mkdir(filepath.Join(parent, del, child), 0777))
+
+	scanChan := make(chan string, 2)
+
+	err := f.deleteDirOnDisk(parent, fsetSnapshot(t, f.fset), scanChan)
+	if err == nil {
+		t.Error("no error")
 	}
 }
 

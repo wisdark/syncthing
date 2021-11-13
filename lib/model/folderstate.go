@@ -22,6 +22,8 @@ const (
 	FolderSyncWaiting
 	FolderSyncPreparing
 	FolderSyncing
+	FolderCleaning
+	FolderCleanWaiting
 	FolderError
 )
 
@@ -39,6 +41,10 @@ func (s folderState) String() string {
 		return "sync-preparing"
 	case FolderSyncing:
 		return "syncing"
+	case FolderCleaning:
+		return "cleaning"
+	case FolderCleanWaiting:
+		return "clean-waiting"
 	case FolderError:
 		return "error"
 	default:
@@ -94,7 +100,7 @@ func (s *stateTracker) setState(newState folderState) {
 	}
 
 	s.current = newState
-	s.changed = time.Now()
+	s.changed = time.Now().Truncate(time.Second)
 
 	s.evLogger.Log(events.StateChanged, eventData)
 }
@@ -133,7 +139,7 @@ func (s *stateTracker) setError(err error) {
 	}
 
 	s.err = err
-	s.changed = time.Now()
+	s.changed = time.Now().Truncate(time.Second)
 
 	s.evLogger.Log(events.StateChanged, eventData)
 }

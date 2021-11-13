@@ -195,6 +195,9 @@ func TestBadPatterns(t *testing.T) {
 		if err == nil {
 			t.Errorf("No error for pattern %q", pat)
 		}
+		if !IsParseError(err) {
+			t.Error("Should have been a parse error:", err)
+		}
 	}
 }
 
@@ -604,8 +607,9 @@ func TestHashOfEmpty(t *testing.T) {
 	firstHash := p1.Hash()
 
 	// Reloading with a non-existent file should empty the patterns and
-	// recalculate the hash. d41d8cd98f00b204e9800998ecf8427e is the md5 of
-	// nothing.
+	// recalculate the hash.
+	// e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 is
+	// the sah256 of nothing.
 
 	p1.Load("file/does/not/exist")
 	secondHash := p1.Hash()
@@ -613,7 +617,7 @@ func TestHashOfEmpty(t *testing.T) {
 	if firstHash == secondHash {
 		t.Error("hash did not change")
 	}
-	if secondHash != "d41d8cd98f00b204e9800998ecf8427e" {
+	if secondHash != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
 		t.Error("second hash is not hash of empty string")
 	}
 	if len(p1.patterns) != 0 {
@@ -1006,10 +1010,13 @@ func TestIssue4901(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		err := pats.Load(".stignore")
 		if err == nil {
-			t.Fatalf("expected an error")
+			t.Fatal("expected an error")
 		}
 		if fs.IsNotExist(err) {
-			t.Fatalf("unexpected error type")
+			t.Fatal("unexpected error type")
+		}
+		if !IsParseError(err) {
+			t.Fatal("failure to load included file should be a parse error")
 		}
 	}
 
@@ -1094,8 +1101,12 @@ func TestPartialIncludeLine(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		if err := pats.Parse(bytes.NewBufferString(tc), ".stignore"); err == nil {
+		err := pats.Parse(bytes.NewBufferString(tc), ".stignore")
+		if err == nil {
 			t.Fatal("should error out")
+		}
+		if !IsParseError(err) {
+			t.Fatal("failure to load included file should be a parse error")
 		}
 	}
 }
@@ -1110,10 +1121,10 @@ func TestSkipIgnoredDirs(t *testing.T) {
 		{`!/t*t`, true},
 		{`!/t?t`, true},
 		{`!/**`, true},
-		{`!/parent/test`, true},
-		{`!/parent/t[eih]t`, true},
-		{`!/parent/t*t`, true},
-		{`!/parent/t?t`, true},
+		{`!/parent/test`, false},
+		{`!/parent/t[eih]t`, false},
+		{`!/parent/t*t`, false},
+		{`!/parent/t?t`, false},
 		{`!/**.mp3`, false},
 		{`!/pa*nt/test`, false},
 		{`!/pa[sdf]nt/t[eih]t`, false},
@@ -1150,6 +1161,17 @@ func TestSkipIgnoredDirs(t *testing.T) {
 	if !pats.SkipIgnoredDirs() {
 		t.Error("SkipIgnoredDirs should be true")
 	}
+
+	stignore = `
+	!/foo/ign*
+	*
+	`
+	if err := pats.Parse(bytes.NewBufferString(stignore), ".stignore"); err != nil {
+		t.Fatal(err)
+	}
+	if pats.SkipIgnoredDirs() {
+		t.Error("SkipIgnoredDirs should be false")
+	}
 }
 
 func TestEmptyPatterns(t *testing.T) {
@@ -1165,6 +1187,9 @@ func TestEmptyPatterns(t *testing.T) {
 		err := m.Parse(strings.NewReader(tc), ".stignore")
 		if err == nil {
 			t.Error("Should reject invalid pattern", tc)
+		}
+		if !IsParseError(err) {
+			t.Fatal("bad pattern should be a parse error")
 		}
 	}
 }

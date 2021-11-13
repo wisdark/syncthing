@@ -79,7 +79,7 @@ type UnsupportedDeviceTypeError struct {
 	deviceType string
 }
 
-func (e UnsupportedDeviceTypeError) Error() string {
+func (e *UnsupportedDeviceTypeError) Error() string {
 	return fmt.Sprintf("Unsupported UPnP device of type %s", e.deviceType)
 }
 
@@ -119,19 +119,26 @@ func Discover(ctx context.Context, renewal, timeout time.Duration) []nat.Device 
 	}()
 
 	seenResults := make(map[string]bool)
-	for result := range resultChan {
-		if seenResults[result.ID()] {
-			l.Debugf("Skipping duplicate result %s", result.ID())
-			continue
+
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				return results
+			}
+			if seenResults[result.ID()] {
+				l.Debugf("Skipping duplicate result %s", result.ID())
+				continue
+			}
+
+			results = append(results, result)
+			seenResults[result.ID()] = true
+
+			l.Debugf("UPnP discovery result %s", result.ID())
+		case <-ctx.Done():
+			return nil
 		}
-
-		results = append(results, result)
-		seenResults[result.ID()] = true
-
-		l.Debugf("UPnP discovery result %s", result.ID())
 	}
-
-	return results
 }
 
 // Search for UPnP InternetGatewayDevices for <timeout> seconds.
@@ -149,7 +156,7 @@ USER-AGENT: syncthing/1.0
 `
 	searchStr := fmt.Sprintf(tpl, deviceType, timeout/time.Second)
 
-	search := []byte(strings.Replace(searchStr, "\n", "\r\n", -1) + "\r\n")
+	search := []byte(strings.ReplaceAll(searchStr, "\n", "\r\n") + "\r\n")
 
 	l.Debugln("Starting discovery of device type", deviceType, "on", intf.Name)
 
@@ -213,7 +220,11 @@ loop:
 		}
 		for _, igd := range igds {
 			igd := igd // Copy before sending pointer to the channel.
-			results <- &igd
+			select {
+			case results <- &igd:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 	l.Debugln("Discovery for device type", deviceType, "on", intf.Name, "finished.")
@@ -423,7 +434,7 @@ func replaceRawPath(u *url.URL, rp string) {
 	}
 }
 
-func soapRequest(url, service, function, message string) ([]byte, error) {
+func soapRequest(ctx context.Context, url, service, function, message string) ([]byte, error) {
 	tpl := `<?xml version="1.0" ?>
 	<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 	<s:Body>%s</s:Body>
@@ -437,6 +448,7 @@ func soapRequest(url, service, function, message string) ([]byte, error) {
 	if err != nil {
 		return resp, err
 	}
+	req.Cancel = ctx.Done()
 	req.Close = true
 	req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
 	req.Header.Set("User-Agent", "syncthing/1.0")

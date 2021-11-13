@@ -11,23 +11,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-)
 
-type GUIConfiguration struct {
-	Enabled                   bool     `xml:"enabled,attr" json:"enabled" default:"true"`
-	RawAddress                string   `xml:"address" json:"address" default:"127.0.0.1:8384"`
-	RawUnixSocketPermissions  string   `xml:"unixSocketPermissions,omitempty" json:"unixSocketPermissions"`
-	User                      string   `xml:"user,omitempty" json:"user"`
-	Password                  string   `xml:"password,omitempty" json:"password"`
-	AuthMode                  AuthMode `xml:"authMode,omitempty" json:"authMode"`
-	RawUseTLS                 bool     `xml:"tls,attr" json:"useTLS"`
-	APIKey                    string   `xml:"apikey,omitempty" json:"apiKey"`
-	InsecureAdminAccess       bool     `xml:"insecureAdminAccess,omitempty" json:"insecureAdminAccess"`
-	Theme                     string   `xml:"theme" json:"theme" default:"default"`
-	Debugging                 bool     `xml:"debugging,attr" json:"debugging"`
-	InsecureSkipHostCheck     bool     `xml:"insecureSkipHostcheck,omitempty" json:"insecureSkipHostcheck"`
-	InsecureAllowFrameLoading bool     `xml:"insecureAllowFrameLoading,omitempty" json:"insecureAllowFrameLoading"`
-}
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/syncthing/syncthing/lib/rand"
+)
 
 func (c GUIConfiguration) IsAuthEnabled() bool {
 	return c.AuthMode == AuthModeLDAP || (len(c.User) > 0 && len(c.Password) > 0)
@@ -127,6 +115,23 @@ func (c GUIConfiguration) URL() string {
 	return u.String()
 }
 
+// SetHashedPassword hashes the given plaintext password and stores the new hash.
+func (c *GUIConfiguration) HashAndSetPassword(password string) error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 0)
+	if err != nil {
+		return err
+	}
+	c.Password = string(hash)
+	return nil
+}
+
+// CompareHashedPassword returns nil when the given plaintext password matches the stored hash.
+func (c GUIConfiguration) CompareHashedPassword(password string) error {
+	configPasswordBytes := []byte(c.Password)
+	passwordBytes := []byte(password)
+	return bcrypt.CompareHashAndPassword(configPasswordBytes, passwordBytes)
+}
+
 // IsValidAPIKey returns true when the given API key is valid, including both
 // the value in config and any overrides
 func (c GUIConfiguration) IsValidAPIKey(apiKey string) bool {
@@ -139,6 +144,12 @@ func (c GUIConfiguration) IsValidAPIKey(apiKey string) bool {
 
 	default:
 		return false
+	}
+}
+
+func (c *GUIConfiguration) prepare() {
+	if c.APIKey == "" {
+		c.APIKey = rand.String(32)
 	}
 }
 

@@ -7,8 +7,14 @@
 package backend
 
 import (
+	"errors"
 	"sync"
 )
+
+// CommitHook is a function that is executed before a WriteTransaction is
+// committed or before it is flushed to disk, e.g. on calling CheckPoint. The
+// transaction can be accessed via a closure.
+type CommitHook func(WriteTransaction) error
 
 // The Reader interface specifies the read-only operations available on the
 // main database and on read-only transactions (snapshots). Note that when
@@ -47,16 +53,15 @@ type ReadTransaction interface {
 // A Checkpoint is a potential partial commit of the transaction so far, for
 // purposes of saving memory when transactions are in-RAM. Note that
 // transactions may be checkpointed *anyway* even if this is not called, due to
-// resource constraints, but this gives you a chance to decide when.
-//
-// Functions can be passed to Checkpoint. These are run if and only if the
-// checkpoint will result in a flush, and will run before the flush. The
-// transaction can be accessed via a closure. If an error is returned from
-// these functions the flush will be aborted and the error bubbled.
+// resource constraints, but this gives you a chance to decide when. If, and
+// only if, calling Checkpoint will result in a partial commit/flush, the
+// CommitHooks passed to Backend.NewWriteTransaction are called before
+// committing. If any of those returns an error, committing is aborted and the
+// error bubbled.
 type WriteTransaction interface {
 	ReadTransaction
 	Writer
-	Checkpoint(...func() error) error
+	Checkpoint() error
 	Commit() error
 }
 
@@ -99,13 +104,16 @@ type Iterator interface {
 // consider always using a transaction of the appropriate type. The
 // transaction isolation level is "read committed" - there are no dirty
 // reads.
+// Location returns the path to the database, as given to Open. The returned string
+// is empty for a db in memory.
 type Backend interface {
 	Reader
 	Writer
 	NewReadTransaction() (ReadTransaction, error)
-	NewWriteTransaction() (WriteTransaction, error)
+	NewWriteTransaction(hooks ...CommitHook) (WriteTransaction, error)
 	Close() error
 	Compact() error
+	Location() string
 }
 
 type Tuning int
@@ -127,54 +135,39 @@ func OpenMemory() Backend {
 
 type errClosed struct{}
 
-func (errClosed) Error() string { return "database is closed" }
+func (*errClosed) Error() string { return "database is closed" }
 
 type errNotFound struct{}
 
-func (errNotFound) Error() string { return "key not found" }
+func (*errNotFound) Error() string { return "key not found" }
 
 func IsClosed(err error) bool {
-	if _, ok := err.(errClosed); ok {
-		return true
-	}
-	if _, ok := err.(*errClosed); ok {
-		return true
-	}
-	return false
+	e := &errClosed{}
+	return errors.As(err, &e)
 }
 
 func IsNotFound(err error) bool {
-	if _, ok := err.(errNotFound); ok {
-		return true
-	}
-	if _, ok := err.(*errNotFound); ok {
-		return true
-	}
-	return false
+	e := &errNotFound{}
+	return errors.As(err, &e)
 }
 
 // releaser manages counting on top of a waitgroup
 type releaser struct {
 	wg   *closeWaitGroup
-	once *sync.Once
+	once sync.Once
 }
 
 func newReleaser(wg *closeWaitGroup) (*releaser, error) {
 	if err := wg.Add(1); err != nil {
 		return nil, err
 	}
-	return &releaser{
-		wg:   wg,
-		once: new(sync.Once),
-	}, nil
+	return &releaser{wg: wg}, nil
 }
 
-func (r releaser) Release() {
+func (r *releaser) Release() {
 	// We use the Once because we may get called multiple times from
 	// Commit() and deferred Release().
-	r.once.Do(func() {
-		r.wg.Done()
-	})
+	r.once.Do(r.wg.Done)
 }
 
 // closeWaitGroup behaves just like a sync.WaitGroup, but does not require
@@ -190,7 +183,7 @@ func (cg *closeWaitGroup) Add(i int) error {
 	cg.closeMut.RLock()
 	defer cg.closeMut.RUnlock()
 	if cg.closed {
-		return errClosed{}
+		return &errClosed{}
 	}
 	cg.WaitGroup.Add(i)
 	return nil

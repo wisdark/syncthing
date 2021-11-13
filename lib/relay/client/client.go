@@ -10,75 +10,44 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/relay/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/svcutil"
 
-	"github.com/thejerf/suture"
-)
-
-type relayClientFactory func(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) RelayClient
-
-var (
-	supportedSchemes = map[string]relayClientFactory{
-		"relay":         newStaticClient,
-		"dynamic+http":  newDynamicClient,
-		"dynamic+https": newDynamicClient,
-	}
+	"github.com/thejerf/suture/v4"
 )
 
 type RelayClient interface {
 	suture.Service
 	Error() error
-	Latency() time.Duration
 	String() string
-	Invitations() chan protocol.SessionInvitation
+	Invitations() <-chan protocol.SessionInvitation
 	URI() *url.URL
 }
 
-func NewClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) (RelayClient, error) {
-	factory, ok := supportedSchemes[uri.Scheme]
-	if !ok {
-		return nil, fmt.Errorf("Unsupported scheme: %s", uri.Scheme)
-	}
+func NewClient(uri *url.URL, certs []tls.Certificate, timeout time.Duration) (RelayClient, error) {
+	invitations := make(chan protocol.SessionInvitation)
 
-	return factory(uri, certs, invitations, timeout), nil
+	switch uri.Scheme {
+	case "relay":
+		return newStaticClient(uri, certs, invitations, timeout), nil
+	case "dynamic+http", "dynamic+https":
+		return newDynamicClient(uri, certs, invitations, timeout), nil
+	default:
+		return nil, fmt.Errorf("unsupported scheme: %s", uri.Scheme)
+	}
 }
 
 type commonClient struct {
-	util.ServiceWithError
-
-	invitations              chan protocol.SessionInvitation
-	closeInvitationsOnFinish bool
-	mut                      sync.RWMutex
+	svcutil.ServiceWithError
+	invitations chan protocol.SessionInvitation
 }
 
 func newCommonClient(invitations chan protocol.SessionInvitation, serve func(context.Context) error, creator string) commonClient {
-	c := commonClient{
-		invitations: invitations,
-		mut:         sync.NewRWMutex(),
+	return commonClient{
+		ServiceWithError: svcutil.AsService(serve, creator),
+		invitations:      invitations,
 	}
-	newServe := func(ctx context.Context) error {
-		defer c.cleanup()
-		return serve(ctx)
-	}
-	c.ServiceWithError = util.AsServiceWithError(newServe, creator)
-	if c.invitations == nil {
-		c.closeInvitationsOnFinish = true
-		c.invitations = make(chan protocol.SessionInvitation)
-	}
-	return c
 }
 
-func (c *commonClient) cleanup() {
-	c.mut.Lock()
-	if c.closeInvitationsOnFinish {
-		close(c.invitations)
-	}
-	c.mut.Unlock()
-}
-
-func (c *commonClient) Invitations() chan protocol.SessionInvitation {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
+func (c *commonClient) Invitations() <-chan protocol.SessionInvitation {
 	return c.invitations
 }

@@ -1,21 +1,18 @@
 // Copyright (C) 2015 Audrius Butkevicius and Contributors (see the CONTRIBUTORS file).
 
-//go:generate go run ../../script/genassets.go gui >auto/gui.go
-
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,11 +22,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/protocol"
+
 	"github.com/golang/groupcache/lru"
 	"github.com/oschwald/geoip2-golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/syncthing/syncthing/cmd/strelaypoolsrv/auto"
+	"github.com/syncthing/syncthing/lib/assets"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/relay/client"
 	"github.com/syncthing/syncthing/lib/sync"
@@ -94,33 +94,35 @@ type result struct {
 }
 
 var (
-	testCert        tls.Certificate
-	knownRelaysFile = filepath.Join(os.TempDir(), "strelaypoolsrv_known_relays")
-	listen          = ":80"
-	dir             string
-	evictionTime    = time.Hour
-	debug           bool
-	getLRUSize      = 10 << 10
-	getLimitBurst   = 10
-	getLimitAvg     = 2
-	postLRUSize     = 1 << 10
-	postLimitBurst  = 2
-	postLimitAvg    = 2
-	getLimit        time.Duration
-	postLimit       time.Duration
-	permRelaysFile  string
-	ipHeader        string
-	geoipPath       string
-	proto           string
-	statsRefresh    = time.Minute / 2
+	testCert          tls.Certificate
+	knownRelaysFile   = filepath.Join(os.TempDir(), "strelaypoolsrv_known_relays")
+	listen            = ":80"
+	dir               string
+	evictionTime      = time.Hour
+	debug             bool
+	getLRUSize        = 10 << 10
+	getLimitBurst     = 10
+	getLimitAvg       = 2
+	postLRUSize       = 1 << 10
+	postLimitBurst    = 2
+	postLimitAvg      = 2
+	getLimit          time.Duration
+	postLimit         time.Duration
+	permRelaysFile    string
+	ipHeader          string
+	geoipPath         string
+	proto             string
+	statsRefresh      = time.Minute / 2
+	requestQueueLen   = 10
+	requestProcessors = 1
 
-	getMut      = sync.NewRWMutex()
+	getMut      = sync.NewMutex()
 	getLRUCache *lru.Cache
 
-	postMut      = sync.NewRWMutex()
+	postMut      = sync.NewMutex()
 	postLRUCache *lru.Cache
 
-	requests = make(chan request, 10)
+	requests chan request
 
 	mut             = sync.NewRWMutex()
 	knownRelays     = make([]*relay, 0)
@@ -133,6 +135,9 @@ const (
 )
 
 func main() {
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Lshortfile)
+
 	flag.StringVar(&listen, "listen", listen, "Listen address")
 	flag.StringVar(&dir, "keys", dir, "Directory where http-cert.pem and http-key.pem is stored for TLS listening")
 	flag.BoolVar(&debug, "debug", debug, "Enable debug output")
@@ -148,8 +153,12 @@ func main() {
 	flag.StringVar(&geoipPath, "geoip", "GeoLite2-City.mmdb", "Path to GeoLite2-City database")
 	flag.StringVar(&proto, "protocol", "tcp", "Protocol used for listening. 'tcp' for IPv4 and IPv6, 'tcp4' for IPv4, 'tcp6' for IPv6")
 	flag.DurationVar(&statsRefresh, "stats-refresh", statsRefresh, "Interval at which to refresh relay stats")
+	flag.IntVar(&requestQueueLen, "request-queue", requestQueueLen, "Queue length for incoming test requests")
+	flag.IntVar(&requestProcessors, "request-processors", requestProcessors, "Number of request processor routines")
 
 	flag.Parse()
+
+	requests = make(chan request, requestQueueLen)
 
 	getLimit = 10 * time.Second / time.Duration(getLimitAvg)
 	postLimit = time.Minute / time.Duration(postLimitAvg)
@@ -166,7 +175,9 @@ func main() {
 
 	testCert = createTestCertificate()
 
-	go requestProcessor()
+	for i := 0; i < requestProcessors; i++ {
+		go requestProcessor()
+	}
 
 	// Load relays from cache in the background.
 	// Load them in a serial fashion to make sure any genuine requests
@@ -200,6 +211,7 @@ func main() {
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS10, // No SSLv3
+			ClientAuth:   tls.RequestClientCert,
 			CipherSuites: []uint16{
 				// No RC4
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -255,88 +267,27 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 func handleAssets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 
-	assets := auto.Assets()
 	path := r.URL.Path[1:]
 	if path == "" {
 		path = "index.html"
 	}
 
-	bs, ok := assets[path]
+	as, ok := auto.Assets()[path]
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	etag := fmt.Sprintf("%d", auto.Generated)
-	modified := time.Unix(auto.Generated, 0).UTC()
-
-	w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
-	w.Header().Set("Etag", etag)
-
-	mtype := mimeTypeForFile(path)
-	if len(mtype) != 0 {
-		w.Header().Set("Content-Type", mtype)
-	}
-
-	if t, err := time.Parse(http.TimeFormat, r.Header.Get("If-Modified-Since")); err == nil && modified.Add(time.Second).After(t) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
-	if match := r.Header.Get("If-None-Match"); match != "" {
-		if strings.Contains(match, etag) {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-	}
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		w.Header().Set("Content-Encoding", "gzip")
-	} else {
-		// ungzip if browser not send gzip accepted header
-		var gr *gzip.Reader
-		gr, _ = gzip.NewReader(bytes.NewReader(bs))
-		bs, _ = ioutil.ReadAll(gr)
-		gr.Close()
-	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bs)))
-
-	w.Write(bs)
-}
-
-func mimeTypeForFile(file string) string {
-	// We use a built in table of the common types since the system
-	// TypeByExtension might be unreliable. But if we don't know, we delegate
-	// to the system.
-	ext := filepath.Ext(file)
-	switch ext {
-	case ".htm", ".html":
-		return "text/html"
-	case ".css":
-		return "text/css"
-	case ".js":
-		return "application/javascript"
-	case ".json":
-		return "application/json"
-	case ".png":
-		return "image/png"
-	case ".ttf":
-		return "application/x-font-ttf"
-	case ".woff":
-		return "application/x-font-woff"
-	case ".svg":
-		return "image/svg+xml"
-	default:
-		return mime.TypeByExtension(ext)
-	}
+	assets.Serve(w, r, as)
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	timer := prometheus.NewTimer(apiRequestsSeconds.WithLabelValues(r.Method))
 
-	lw := NewLoggingResponseWriter(w)
-
+	w = NewLoggingResponseWriter(w)
 	defer func() {
 		timer.ObserveDuration()
+		lw := w.(*loggingResponseWriter)
 		apiRequestsTotal.WithLabelValues(r.Method, strconv.Itoa(lw.statusCode)).Inc()
 	}()
 
@@ -367,8 +318,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 func handleGetRequest(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+
 	mut.RLock()
-	relays := append(permanentRelays, knownRelays...)
+	relays := make([]*relay, len(permanentRelays)+len(knownRelays))
+	n := copy(relays, permanentRelays)
+	copy(relays[n:], knownRelays)
 	mut.RUnlock()
 
 	// Shuffle
@@ -388,6 +342,12 @@ func handleGetRequest(rw http.ResponseWriter, r *http.Request) {
 }
 
 func handlePostRequest(w http.ResponseWriter, r *http.Request) {
+	var relayCert *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		relayCert = r.TLS.PeerCertificates[0]
+		log.Printf("Got TLS cert from relay server")
+	}
+
 	var newRelay relay
 	err := json.NewDecoder(r.Body).Decode(&newRelay)
 	r.Body.Close()
@@ -396,7 +356,7 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to parse payload")
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -405,8 +365,18 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to parse URI", newRelay.URL)
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	if relayCert != nil {
+		advertisedId := uri.Query().Get("id")
+		idFromCert := protocol.NewDeviceID(relayCert.Raw).String()
+		if advertisedId != idFromCert {
+			log.Println("Warning: Relay server requested to join with an ID different from the join request, rejecting")
+			http.Error(w, "mismatched advertised id and join request cert", http.StatusBadRequest)
+			return
+		}
 	}
 
 	host, port, err := net.SplitHostPort(uri.Host)
@@ -414,7 +384,7 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to split URI", newRelay.URL)
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -429,7 +399,7 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 	if ip == nil || ip.IsUnspecified() {
 		uri.Host = net.JoinHostPort(rhost, port)
 		newRelay.URL = uri.String()
-	} else if host != rhost {
+	} else if host != rhost && relayCert == nil {
 		if debug {
 			log.Println("IP address advertised does not match client IP address", r.RemoteAddr, uri)
 		}
@@ -490,11 +460,11 @@ func handleRelayTest(request request) {
 	if debug {
 		log.Println("Request for", request.relay)
 	}
-	if !client.TestRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3) {
+	if err := client.TestRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3); err != nil {
 		if debug {
-			log.Println("Test for relay", request.relay, "failed")
+			log.Println("Test for relay", request.relay, "failed:", err)
 		}
-		request.result <- result{fmt.Errorf("connection test failed"), 0}
+		request.result <- result{err, 0}
 		return
 	}
 
@@ -506,7 +476,7 @@ func handleRelayTest(request request) {
 		updateMetrics(request.relay.uri.Host, *stats, location)
 	}
 	request.relay.Stats = stats
-	request.relay.StatsRetrieved = time.Now()
+	request.relay.StatsRetrieved = time.Now().Truncate(time.Second)
 	request.relay.Location = location
 
 	timer, ok := evictionTimers[request.relay.uri.Host]
@@ -572,26 +542,21 @@ func evict(relay *relay) func() {
 	}
 }
 
-func limit(addr string, cache *lru.Cache, lock sync.RWMutex, intv time.Duration, burst int) bool {
+func limit(addr string, cache *lru.Cache, lock sync.Mutex, intv time.Duration, burst int) bool {
 	if host, _, err := net.SplitHostPort(addr); err == nil {
 		addr = host
 	}
 
-	lock.RLock()
-	bkt, ok := cache.Get(addr)
-	lock.RUnlock()
-	if ok {
-		bkt := bkt.(*rate.Limiter)
-		if !bkt.Allow() {
-			// Rate limit
-			return true
-		}
-	} else {
-		lock.Lock()
-		cache.Add(addr, rate.NewLimiter(rate.Every(intv), burst))
-		lock.Unlock()
+	lock.Lock()
+	v, _ := cache.Get(addr)
+	bkt, ok := v.(*rate.Limiter)
+	if !ok {
+		bkt = rate.NewLimiter(rate.Every(intv), burst)
+		cache.Add(addr, bkt)
 	}
-	return false
+	lock.Unlock()
+
+	return !bkt.Allow()
 }
 
 func loadRelays(file string) []*relay {

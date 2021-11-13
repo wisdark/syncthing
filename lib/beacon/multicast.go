@@ -56,7 +56,7 @@ func writeMulticasts(ctx context.Context, inbox <-chan []byte, addr string) erro
 		select {
 		case bs = <-inbox:
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		}
 
 		intfs, err := net.Interfaces()
@@ -67,6 +67,10 @@ func writeMulticasts(ctx context.Context, inbox <-chan []byte, addr string) erro
 
 		success := 0
 		for _, intf := range intfs {
+			if intf.Flags&net.FlagMulticast == 0 {
+				continue
+			}
+
 			wcm.IfIndex = intf.Index
 			pconn.SetWriteDeadline(time.Now().Add(time.Second))
 			_, err = pconn.WriteTo(bs, wcm, gaddr)
@@ -83,7 +87,7 @@ func writeMulticasts(ctx context.Context, inbox <-chan []byte, addr string) erro
 
 			select {
 			case <-doneCtx.Done():
-				return nil
+				return doneCtx.Err()
 			default:
 			}
 		}
@@ -140,7 +144,7 @@ func readMulticasts(ctx context.Context, outbox chan<- recv, addr string) error 
 	for {
 		select {
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		default:
 		}
 		n, _, addr, err := pconn.ReadFrom(bs)

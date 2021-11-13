@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/config"
+
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
@@ -59,9 +61,18 @@ func TestSimpleVersioningVersionCount(t *testing.T) {
 		t.Error(err)
 	}
 
-	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, dir)
+	cfg := config.FolderConfiguration{
+		FilesystemType: fs.FilesystemTypeBasic,
+		Path:           dir,
+		Versioning: config.VersioningConfiguration{
+			Params: map[string]string{
+				"keep": "2",
+			},
+		},
+	}
+	fs := cfg.Filesystem()
 
-	v := newSimple(fs, map[string]string{"keep": "2"})
+	v := newSimple(cfg)
 
 	path := "test"
 

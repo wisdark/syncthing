@@ -15,21 +15,44 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/v3/disk"
 )
 
 var (
-	ErrInvalidFilename = errors.New("filename is invalid")
-	ErrNotRelative     = errors.New("not a relative path")
+	errInvalidFilenameEmpty               = errors.New("name is invalid, must not be empty")
+	errInvalidFilenameWindowsSpacePeriod  = errors.New("name is invalid, must not end in space or period on Windows")
+	errInvalidFilenameWindowsReservedName = errors.New("name is invalid, contains Windows reserved name (NUL, COM1, etc.)")
+	errInvalidFilenameWindowsReservedChar = errors.New("name is invalid, contains Windows reserved character (?, *, etc.)")
+	errNotRelative                        = errors.New("not a relative path")
 )
+
+type OptionJunctionsAsDirs struct{}
+
+func (o *OptionJunctionsAsDirs) apply(fs Filesystem) {
+	if basic, ok := fs.(*BasicFilesystem); !ok {
+		l.Warnln("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
+	} else {
+		basic.junctionsAsDirs = true
+	}
+}
+
+func (o *OptionJunctionsAsDirs) String() string {
+	return "junctionsAsDirs"
+}
 
 // The BasicFilesystem implements all aspects by delegating to package os.
 // All paths are relative to the root and cannot (should not) escape the root directory.
 type BasicFilesystem struct {
-	root string
+	root            string
+	junctionsAsDirs bool
+	options         []Option
 }
 
-func newBasicFilesystem(root string) *BasicFilesystem {
+func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
+	if root == "" {
+		root = "." // Otherwise "" becomes "/" below
+	}
+
 	// The reason it's done like this:
 	// C:          ->  C:\            ->  C:\        (issue that this is trying to fix)
 	// C:\somedir  ->  C:\somedir\    ->  C:\somedir
@@ -60,7 +83,14 @@ func newBasicFilesystem(root string) *BasicFilesystem {
 		root = longFilenameSupport(root)
 	}
 
-	return &BasicFilesystem{root}
+	fs := &BasicFilesystem{
+		root:    root,
+		options: opts,
+	}
+	for _, opt := range opts {
+		opt.apply(fs)
+	}
+	return fs
 }
 
 // rooted expands the relative path to the full path that is then used with os
@@ -74,7 +104,7 @@ func (f *BasicFilesystem) rooted(rel string) (string, error) {
 func rooted(rel, root string) (string, error) {
 	// The root must not be empty.
 	if root == "" {
-		return "", ErrInvalidFilename
+		return "", errInvalidFilenameEmpty
 	}
 
 	var err error
@@ -141,7 +171,7 @@ func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	fi, err := underlyingLstat(name)
+	fi, err := f.underlyingLstat(name)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +301,8 @@ func (f *BasicFilesystem) Usage(name string) (Usage, error) {
 		return Usage{}, err
 	}
 	return Usage{
-		Free:  int64(u.Free),
-		Total: int64(u.Total),
+		Free:  u.Free,
+		Total: u.Total,
 	}, nil
 }
 
@@ -284,6 +314,10 @@ func (f *BasicFilesystem) URI() string {
 	return strings.TrimPrefix(f.root, `\\?\`)
 }
 
+func (f *BasicFilesystem) Options() []Option {
+	return f.options
+}
+
 func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 	// Like os.SameFile, we always return false unless fi1 and fi2 were created
 	// by this package's Stat/Lstat method.
@@ -293,7 +327,15 @@ func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 		return false
 	}
 
-	return os.SameFile(f1.FileInfo, f2.FileInfo)
+	return os.SameFile(f1.osFileInfo(), f2.osFileInfo())
+}
+
+func (f *BasicFilesystem) underlying() (Filesystem, bool) {
+	return nil, false
+}
+
+func (f *BasicFilesystem) wrapperType() filesystemWrapperType {
+	return filesystemWrapperTypeNone
 }
 
 // basicFile implements the fs.File interface on top of an os.File

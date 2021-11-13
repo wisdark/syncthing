@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"log"
@@ -21,7 +22,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 )
 
 const (
@@ -92,20 +93,21 @@ func main() {
 	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
 
-	log.Println(build.LongVersion)
+	log.Println(build.LongVersionFor("stdiscosrv"))
 	if *showVersion {
 		return
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
+	if os.IsNotExist(err) {
 		log.Println("Failed to load keypair. Generating one, this might take a while...")
 		cert, err = tlsutil.NewCertificate(certFile, keyFile, "stdiscosrv", 20*365)
 		if err != nil {
 			log.Fatalln("Failed to generate X509 key pair:", err)
 		}
+	} else if err != nil {
+		log.Fatalln("Failed to load keypair:", err)
 	}
-
 	devID := protocol.NewDeviceID(cert.Certificate[0])
 	log.Println("Server device ID is", devID)
 
@@ -182,5 +184,5 @@ func main() {
 	}
 
 	// Engage!
-	main.Serve()
+	main.Serve(context.Background())
 }

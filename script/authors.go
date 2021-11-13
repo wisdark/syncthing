@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build ignore
 // +build ignore
 
 // Generates the list of contributors in gui/index.html based on contents of
@@ -215,6 +216,9 @@ var excludeCommits = stringSetFromStrings([]string{
 	"254c63763a3ad42fd82259f1767db526cff94a14",
 	"32a76901a91ff0f663db6f0830e0aedec946e4d0",
 	"bc7639b0ffcea52b2197efb1c0bb68b338d1c915",
+	"9bdcadf6345aba3a939e9e58d85b89dbe9d44bc9",
+	"b933e9666abdfcd22919dd458c930d944e1e1b7f",
+	"b84d960a81c1282a79e2b9477558de4f1af6faae",
 })
 
 // allAuthors returns the set of authors in the git commit log, except those

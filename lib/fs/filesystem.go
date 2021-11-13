@@ -16,6 +16,17 @@ import (
 	"time"
 )
 
+type filesystemWrapperType int32
+
+const (
+	filesystemWrapperTypeNone filesystemWrapperType = iota
+	filesystemWrapperTypeMtime
+	filesystemWrapperTypeCase
+	filesystemWrapperTypeError
+	filesystemWrapperTypeWalk
+	filesystemWrapperTypeLog
+)
+
 // The Filesystem interface abstracts access to the file system.
 type Filesystem interface {
 	Chmod(name string, mode FileMode) error
@@ -47,7 +58,12 @@ type Filesystem interface {
 	Usage(name string) (Usage, error)
 	Type() FilesystemType
 	URI() string
+	Options() []Option
 	SameFile(fi1, fi2 FileInfo) bool
+
+	// Used for unwrapping things
+	underlying() (Filesystem, bool)
+	wrapperType() filesystemWrapperType
 }
 
 // The File interface abstracts access to a regular file, being a somewhat
@@ -91,8 +107,8 @@ func (fm FileMode) String() string {
 
 // Usage represents filesystem space usage
 type Usage struct {
-	Free  int64
-	Total int64
+	Free  uint64
+	Total uint64
 }
 
 type Matcher interface {
@@ -163,8 +179,14 @@ var SkipDir = filepath.SkipDir
 // IsExist is the equivalent of os.IsExist
 var IsExist = os.IsExist
 
+// IsExist is the equivalent of os.ErrExist
+var ErrExist = os.ErrExist
+
 // IsNotExist is the equivalent of os.IsNotExist
 var IsNotExist = os.IsNotExist
+
+// ErrNotExist is the equivalent of os.ErrNotExist
+var ErrNotExist = os.ErrNotExist
 
 // IsPermission is the equivalent of os.IsPermission
 var IsPermission = os.IsPermission
@@ -172,13 +194,24 @@ var IsPermission = os.IsPermission
 // IsPathSeparator is the equivalent of os.IsPathSeparator
 var IsPathSeparator = os.IsPathSeparator
 
-func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
+// Option modifies a filesystem at creation. An option might be specific
+// to a filesystem-type.
+//
+// String is used to detect options with the same effect, i.e. must be different
+// for options with different effects. Meaning if an option has parameters, a
+// representation of those must be part of the returned string.
+type Option interface {
+	String() string
+	apply(Filesystem)
+}
+
+func NewFilesystem(fsType FilesystemType, uri string, opts ...Option) Filesystem {
 	var fs Filesystem
 	switch fsType {
 	case FilesystemTypeBasic:
-		fs = newBasicFilesystem(uri)
+		fs = newBasicFilesystem(uri, opts...)
 	case FilesystemTypeFake:
-		fs = newFakeFilesystem(uri)
+		fs = newFakeFilesystem(uri, opts...)
 	default:
 		l.Debugln("Unknown filesystem", fsType, uri)
 		fs = &errorFilesystem{
@@ -226,7 +259,7 @@ func Canonicalize(file string) (string, error) {
 		// The relative path may pretend to be an absolute path within
 		// the root, but the double path separator on Windows implies
 		// something else and is out of spec.
-		return "", ErrNotRelative
+		return "", errNotRelative
 	}
 
 	// The relative path should be clean from internal dotdots and similar
@@ -234,12 +267,11 @@ func Canonicalize(file string) (string, error) {
 	file = filepath.Clean(file)
 
 	// It is not acceptable to attempt to traverse upwards.
-	switch file {
-	case "..":
-		return "", ErrNotRelative
+	if file == ".." {
+		return "", errNotRelative
 	}
 	if strings.HasPrefix(file, ".."+pathSep) {
-		return "", ErrNotRelative
+		return "", errNotRelative
 	}
 
 	if strings.HasPrefix(file, pathSep) {
@@ -250,4 +282,33 @@ func Canonicalize(file string) (string, error) {
 	}
 
 	return file, nil
+}
+
+// wrapFilesystem should always be used when wrapping a Filesystem.
+// It ensures proper wrapping order, which right now means:
+// `logFilesystem` needs to be the outermost wrapper for caller lookup.
+func wrapFilesystem(fs Filesystem, wrapFn func(Filesystem) Filesystem) Filesystem {
+	logFs, ok := fs.(*logFilesystem)
+	if ok {
+		fs = logFs.Filesystem
+	}
+	fs = wrapFn(fs)
+	if ok {
+		fs = &logFilesystem{fs}
+	}
+	return fs
+}
+
+// unwrapFilesystem removes "wrapping" filesystems to expose the filesystem of the requested wrapperType, if it exists.
+func unwrapFilesystem(fs Filesystem, wrapperType filesystemWrapperType) (Filesystem, bool) {
+	var ok bool
+	for {
+		if fs.wrapperType() == wrapperType {
+			return fs, true
+		}
+		fs, ok = fs.underlying()
+		if !ok {
+			return nil, false
+		}
+	}
 }

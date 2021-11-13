@@ -41,20 +41,32 @@ func writeBroadcasts(ctx context.Context, inbox <-chan []byte, port int) error {
 		select {
 		case bs = <-inbox:
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		}
 
-		addrs, err := net.InterfaceAddrs()
+		intfs, err := net.Interfaces()
 		if err != nil {
 			l.Debugln(err)
 			return err
 		}
 
 		var dsts []net.IP
-		for _, addr := range addrs {
-			if iaddr, ok := addr.(*net.IPNet); ok && len(iaddr.IP) >= 4 && iaddr.IP.IsGlobalUnicast() && iaddr.IP.To4() != nil {
-				baddr := bcast(iaddr)
-				dsts = append(dsts, baddr.IP)
+		for _, intf := range intfs {
+			if intf.Flags&net.FlagBroadcast == 0 {
+				continue
+			}
+
+			addrs, err := intf.Addrs()
+			if err != nil {
+				l.Debugln(err)
+				return err
+			}
+
+			for _, addr := range addrs {
+				if iaddr, ok := addr.(*net.IPNet); ok && len(iaddr.IP) >= 4 && iaddr.IP.IsGlobalUnicast() && iaddr.IP.To4() != nil {
+					baddr := bcast(iaddr)
+					dsts = append(dsts, baddr.IP)
+				}
 			}
 		}
 
@@ -91,7 +103,7 @@ func writeBroadcasts(ctx context.Context, inbox <-chan []byte, port int) error {
 		}
 
 		if success == 0 {
-			l.Debugln("couldn't send any braodcasts")
+			l.Debugln("couldn't send any broadcasts")
 			return err
 		}
 	}
@@ -126,7 +138,7 @@ func readBroadcasts(ctx context.Context, outbox chan<- recv, port int) error {
 		select {
 		case outbox <- recv{c, addr}:
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		default:
 			l.Debugln("dropping message")
 		}

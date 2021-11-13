@@ -1,13 +1,11 @@
 // Copyright (C) 2014 The Protocol Authors.
 
-//go:generate go run ../../script/protofmt.go bep.proto
-//go:generate protoc -I ../../ -I . --gogofast_out=. bep.proto
-
 package protocol
 
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
@@ -23,6 +21,31 @@ const (
 	Version13HelloMagic    uint32 = 0x9F79BC40 // old
 )
 
+// FileIntf is the set of methods implemented by both FileInfo and
+// db.FileInfoTruncated.
+type FileIntf interface {
+	FileSize() int64
+	FileName() string
+	FileLocalFlags() uint32
+	IsDeleted() bool
+	IsInvalid() bool
+	IsIgnored() bool
+	IsUnsupported() bool
+	MustRescan() bool
+	IsReceiveOnlyChanged() bool
+	IsDirectory() bool
+	IsSymlink() bool
+	ShouldConflict() bool
+	HasPermissionBits() bool
+	SequenceNo() int64
+	BlockSize() int
+	FileVersion() Vector
+	FileType() FileInfoType
+	FilePermissions() uint32
+	FileModifiedBy() ShortID
+	ModTime() time.Time
+}
+
 func (m Hello) Magic() uint32 {
 	return HelloMessageMagic
 }
@@ -30,14 +53,14 @@ func (m Hello) Magic() uint32 {
 func (f FileInfo) String() string {
 	switch f.Type {
 	case FileInfoTypeDirectory:
-		return fmt.Sprintf("Directory{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v}",
-			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions)
+		return fmt.Sprintf("Directory{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, VersionHash:%x, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v}",
+			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.VersionHash, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions)
 	case FileInfoTypeFile:
-		return fmt.Sprintf("File{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, Length:%d, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v, BlockSize:%d, Blocks:%v}",
-			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.Size, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions, f.RawBlockSize, f.Blocks)
-	case FileInfoTypeSymlink, FileInfoTypeDeprecatedSymlinkDirectory, FileInfoTypeDeprecatedSymlinkFile:
-		return fmt.Sprintf("Symlink{Name:%q, Type:%v, Sequence:%d, Version:%v, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v, SymlinkTarget:%q}",
-			f.Name, f.Type, f.Sequence, f.Version, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions, f.SymlinkTarget)
+		return fmt.Sprintf("File{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, VersionHash:%x, Length:%d, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v, BlockSize:%d, Blocks:%v, BlocksHash:%x}",
+			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.VersionHash, f.Size, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions, f.RawBlockSize, f.Blocks, f.BlocksHash)
+	case FileInfoTypeSymlink, FileInfoTypeSymlinkDirectory, FileInfoTypeSymlinkFile:
+		return fmt.Sprintf("Symlink{Name:%q, Type:%v, Sequence:%d, Version:%v, VersionHash:%x, Deleted:%v, Invalid:%v, LocalFlags:0x%x, NoPermissions:%v, SymlinkTarget:%q}",
+			f.Name, f.Type, f.Sequence, f.Version, f.VersionHash, f.Deleted, f.RawInvalid, f.LocalFlags, f.NoPermissions, f.SymlinkTarget)
 	default:
 		panic("mystery file type detected")
 	}
@@ -77,7 +100,7 @@ func (f FileInfo) ShouldConflict() bool {
 
 func (f FileInfo) IsSymlink() bool {
 	switch f.Type {
-	case FileInfoTypeSymlink, FileInfoTypeDeprecatedSymlinkDirectory, FileInfoTypeDeprecatedSymlinkFile:
+	case FileInfoTypeSymlink, FileInfoTypeSymlinkDirectory, FileInfoTypeSymlinkFile:
 		return true
 	default:
 		return false
@@ -99,10 +122,10 @@ func (f FileInfo) FileSize() int64 {
 }
 
 func (f FileInfo) BlockSize() int {
-	if f.RawBlockSize == 0 {
+	if f.RawBlockSize < MinBlockSize {
 		return MinBlockSize
 	}
-	return int(f.RawBlockSize)
+	return f.RawBlockSize
 }
 
 func (f FileInfo) FileName() string {
@@ -139,7 +162,7 @@ func (f FileInfo) FileModifiedBy() ShortID {
 
 // WinsConflict returns true if "f" is the one to choose when it is in
 // conflict with "other".
-func (f FileInfo) WinsConflict(other FileInfo) bool {
+func WinsConflict(f, other FileIntf) bool {
 	// If only one of the files is invalid, that one loses.
 	if f.IsInvalid() != other.IsInvalid() {
 		return !f.IsInvalid()
@@ -164,11 +187,7 @@ func (f FileInfo) WinsConflict(other FileInfo) bool {
 
 	// The modification times were equal. Use the device ID in the version
 	// vector as tie breaker.
-	return f.Version.Compare(other.Version) == ConcurrentGreater
-}
-
-func (f FileInfo) IsEmpty() bool {
-	return f.Version.Counters == nil
+	return f.FileVersion().Compare(other.FileVersion()) == ConcurrentGreater
 }
 
 func (f FileInfo) IsEquivalent(other FileInfo, modTimeWindow time.Duration) bool {
@@ -216,7 +235,7 @@ func (f FileInfo) isEquivalent(other FileInfo, modTimeWindow time.Duration, igno
 
 	switch f.Type {
 	case FileInfoTypeFile:
-		return f.Size == other.Size && ModTimeEqual(f.ModTime(), other.ModTime(), modTimeWindow) && (ignoreBlocks || BlocksEqual(f.Blocks, other.Blocks))
+		return f.Size == other.Size && ModTimeEqual(f.ModTime(), other.ModTime(), modTimeWindow) && (ignoreBlocks || f.BlocksEqual(other))
 	case FileInfoTypeSymlink:
 		return f.SymlinkTarget == other.SymlinkTarget
 	case FileInfoTypeDirectory:
@@ -249,9 +268,22 @@ func PermsEqual(a, b uint32) bool {
 	}
 }
 
-// BlocksEqual returns whether two slices of blocks are exactly the same hash
+// BlocksEqual returns true when the two files have identical block lists.
+func (f FileInfo) BlocksEqual(other FileInfo) bool {
+	// If both sides have blocks hashes and they match, we are good. If they
+	// don't match still check individual block hashes to catch differences
+	// in weak hashes only (e.g. after switching weak hash algo).
+	if len(f.BlocksHash) > 0 && len(other.BlocksHash) > 0 && bytes.Equal(f.BlocksHash, other.BlocksHash) {
+		return true
+	}
+
+	// Actually compare the block lists in full.
+	return blocksEqual(f.Blocks, other.Blocks)
+}
+
+// blocksEqual returns whether two slices of blocks are exactly the same hash
 // and index pair wise.
-func BlocksEqual(a, b []BlockInfo) bool {
+func blocksEqual(a, b []BlockInfo) bool {
 	if len(b) != len(a) {
 		return false
 	}
@@ -265,16 +297,16 @@ func BlocksEqual(a, b []BlockInfo) bool {
 	return true
 }
 
-func (f *FileInfo) SetMustRescan(by ShortID) {
-	f.setLocalFlags(by, FlagLocalMustRescan)
+func (f *FileInfo) SetMustRescan() {
+	f.setLocalFlags(FlagLocalMustRescan)
 }
 
-func (f *FileInfo) SetIgnored(by ShortID) {
-	f.setLocalFlags(by, FlagLocalIgnored)
+func (f *FileInfo) SetIgnored() {
+	f.setLocalFlags(FlagLocalIgnored)
 }
 
-func (f *FileInfo) SetUnsupported(by ShortID) {
-	f.setLocalFlags(by, FlagLocalUnsupported)
+func (f *FileInfo) SetUnsupported() {
+	f.setLocalFlags(FlagLocalUnsupported)
 }
 
 func (f *FileInfo) SetDeleted(by ShortID) {
@@ -285,10 +317,9 @@ func (f *FileInfo) SetDeleted(by ShortID) {
 	f.setNoContent()
 }
 
-func (f *FileInfo) setLocalFlags(by ShortID, flags uint32) {
+func (f *FileInfo) setLocalFlags(flags uint32) {
 	f.RawInvalid = false
 	f.LocalFlags = flags
-	f.ModifiedBy = by
 	f.setNoContent()
 }
 
@@ -313,7 +344,7 @@ func (b BlockInfo) IsEmpty() bool {
 type IndexID uint64
 
 func (i IndexID) String() string {
-	return fmt.Sprintf("0x%16X", uint64(i))
+	return fmt.Sprintf("0x%016X", uint64(i))
 }
 
 func (i IndexID) Marshal() ([]byte, error) {
@@ -331,7 +362,7 @@ func (i *IndexID) Unmarshal(bs []byte) error {
 }
 
 func NewIndexID() IndexID {
-	return IndexID(rand.Int64())
+	return IndexID(rand.Uint64())
 }
 
 func (f Folder) Description() string {
@@ -346,6 +377,37 @@ func BlocksHash(bs []BlockInfo) []byte {
 	h := sha256.New()
 	for _, b := range bs {
 		_, _ = h.Write(b.Hash)
+		_ = binary.Write(h, binary.BigEndian, b.WeakHash)
 	}
 	return h.Sum(nil)
+}
+
+func VectorHash(v Vector) []byte {
+	h := sha256.New()
+	for _, c := range v.Counters {
+		if err := binary.Write(h, binary.BigEndian, c.ID); err != nil {
+			panic("impossible: failed to write c.ID to hash function: " + err.Error())
+		}
+		if err := binary.Write(h, binary.BigEndian, c.Value); err != nil {
+			panic("impossible: failed to write c.Value to hash function: " + err.Error())
+		}
+	}
+	return h.Sum(nil)
+}
+
+func (x *FileInfoType) MarshalJSON() ([]byte, error) {
+	return json.Marshal(x.String())
+}
+
+func (x *FileInfoType) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	n, ok := FileInfoType_value[s]
+	if !ok {
+		return errors.New("invalid value: " + s)
+	}
+	*x = FileInfoType(n)
+	return nil
 }

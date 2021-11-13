@@ -15,71 +15,102 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/thejerf/suture"
-
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
 )
 
 // Service runs a loop for discovery of IGDs (Internet Gateway Devices) and
 // setup/renewal of a port mapping.
 type Service struct {
-	suture.Service
-
-	id  protocol.DeviceID
-	cfg config.Wrapper
+	id               protocol.DeviceID
+	cfg              config.Wrapper
+	processScheduled chan struct{}
 
 	mappings []*Mapping
-	timer    *time.Timer
+	enabled  bool
 	mut      sync.RWMutex
 }
 
 func NewService(id protocol.DeviceID, cfg config.Wrapper) *Service {
 	s := &Service{
-		id:  id,
-		cfg: cfg,
+		id:               id,
+		cfg:              cfg,
+		processScheduled: make(chan struct{}, 1),
 
-		timer: time.NewTimer(0),
-		mut:   sync.NewRWMutex(),
+		mut: sync.NewRWMutex(),
 	}
-	s.Service = util.AsService(s.serve, s.String())
+	cfgCopy := cfg.RawCopy()
+	s.CommitConfiguration(cfgCopy, cfgCopy)
 	return s
 }
 
-func (s *Service) serve(ctx context.Context) {
+func (s *Service) VerifyConfiguration(from, to config.Configuration) error {
+	return nil
+}
+
+func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
+	s.mut.Lock()
+	if !s.enabled && to.Options.NATEnabled {
+		l.Debugln("Starting NAT service")
+		s.enabled = true
+		s.scheduleProcess()
+	} else if s.enabled && !to.Options.NATEnabled {
+		l.Debugln("Stopping NAT service")
+		s.enabled = false
+	}
+	s.mut.Unlock()
+	return true
+}
+
+func (s *Service) Serve(ctx context.Context) error {
+	s.cfg.Subscribe(s)
+	defer s.cfg.Unsubscribe(s)
+
 	announce := stdsync.Once{}
 
-	s.mut.Lock()
-	s.timer.Reset(0)
-	s.mut.Unlock()
+	timer := time.NewTimer(0)
 
 	for {
 		select {
-		case <-s.timer.C:
-			if found := s.process(ctx); found != -1 {
-				announce.Do(func() {
-					suffix := "s"
-					if found == 1 {
-						suffix = ""
-					}
-					l.Infoln("Detected", found, "NAT service"+suffix)
-				})
+		case <-timer.C:
+		case <-s.processScheduled:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 		case <-ctx.Done():
-			s.timer.Stop()
+			timer.Stop()
 			s.mut.RLock()
 			for _, mapping := range s.mappings {
 				mapping.clearAddresses()
 			}
 			s.mut.RUnlock()
-			return
+			return ctx.Err()
+		}
+		s.mut.RLock()
+		enabled := s.enabled
+		s.mut.RUnlock()
+		if !enabled {
+			continue
+		}
+		found, renewIn := s.process(ctx)
+		timer.Reset(renewIn)
+		if found != -1 {
+			announce.Do(func() {
+				suffix := "s"
+				if found == 1 {
+					suffix = ""
+				}
+				l.Infoln("Detected", found, "NAT service"+suffix)
+			})
 		}
 	}
 }
 
-func (s *Service) process(ctx context.Context) int {
+func (s *Service) process(ctx context.Context) (int, time.Duration) {
 	// toRenew are mappings which are due for renewal
 	// toUpdate are the remaining mappings, which will only be updated if one of
 	// the old IGDs has gone away, or a new IGD has appeared, but only if we
@@ -104,21 +135,11 @@ func (s *Service) process(ctx context.Context) int {
 			}
 		}
 	}
-	// Reset the timer while holding the lock, because of the following race:
-	// T1: process acquires lock
-	// T1: process checks the mappings and gets next renewal time in 30m
-	// T2: process releases the lock
-	// T2: NewMapping acquires the lock
-	// T2: NewMapping adds mapping
-	// T2: NewMapping releases the lock
-	// T2: NewMapping resets timer to 1s
-	// T1: process resets timer to 30
-	s.timer.Reset(renewIn)
 	s.mut.RUnlock()
 
 	// Don't do anything, unless we really need to renew
 	if len(toRenew) == 0 {
-		return -1
+		return -1, renewIn
 	}
 
 	nats := discoverAll(ctx, time.Duration(s.cfg.Options().NATRenewalM)*time.Minute, time.Duration(s.cfg.Options().NATTimeoutS)*time.Second)
@@ -131,7 +152,14 @@ func (s *Service) process(ctx context.Context) int {
 		s.updateMapping(ctx, mapping, nats, false)
 	}
 
-	return len(nats)
+	return len(nats), renewIn
+}
+
+func (s *Service) scheduleProcess() {
+	select {
+	case s.processScheduled <- struct{}{}: // 1-buffered
+	default:
+	}
 }
 
 func (s *Service) NewMapping(protocol Protocol, ip net.IP, port int) *Mapping {
@@ -147,9 +175,8 @@ func (s *Service) NewMapping(protocol Protocol, ip net.IP, port int) *Mapping {
 
 	s.mut.Lock()
 	s.mappings = append(s.mappings, mapping)
-	// Reset the timer while holding the lock, see process() for explanation
-	s.timer.Reset(time.Second)
 	s.mut.Unlock()
+	s.scheduleProcess()
 
 	return mapping
 }
@@ -304,7 +331,7 @@ func (s *Service) tryNATDevice(ctx context.Context, natd Device, intPort, extPor
 	if extPort != 0 {
 		// First try renewing our existing mapping, if we have one.
 		name := fmt.Sprintf("syncthing-%d", extPort)
-		port, err = natd.AddPortMapping(TCP, intPort, extPort, name, leaseTime)
+		port, err = natd.AddPortMapping(ctx, TCP, intPort, extPort, name, leaseTime)
 		if err == nil {
 			extPort = port
 			goto findIP
@@ -315,14 +342,14 @@ func (s *Service) tryNATDevice(ctx context.Context, natd Device, intPort, extPor
 	for i := 0; i < 10; i++ {
 		select {
 		case <-ctx.Done():
-			return Address{}, nil
+			return Address{}, ctx.Err()
 		default:
 		}
 
 		// Then try up to ten random ports.
 		extPort = 1024 + predictableRand.Intn(65535-1024)
 		name := fmt.Sprintf("syncthing-%d", extPort)
-		port, err = natd.AddPortMapping(TCP, intPort, extPort, name, leaseTime)
+		port, err = natd.AddPortMapping(ctx, TCP, intPort, extPort, name, leaseTime)
 		if err == nil {
 			extPort = port
 			goto findIP
@@ -333,7 +360,7 @@ func (s *Service) tryNATDevice(ctx context.Context, natd Device, intPort, extPor
 	return Address{}, err
 
 findIP:
-	ip, err := natd.GetExternalIPAddress()
+	ip, err := natd.GetExternalIPAddress(ctx)
 	if err != nil {
 		l.Debugln("Error getting external ip on", natd.ID(), err)
 		ip = nil

@@ -121,6 +121,10 @@ func TestChmodDir(t *testing.T) {
 	if err := os.Mkdir(path, mode); err != nil {
 		t.Error(err)
 	}
+	// On UNIX, Mkdir will subtract the umask, so force desired mode explicitly
+	if err := os.Chmod(path, mode); err != nil {
+		t.Error(err)
+	}
 
 	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != mode {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
@@ -514,6 +518,10 @@ func TestNewBasicFilesystem(t *testing.T) {
 		t.Skip("non-windows root paths")
 	}
 
+	currentDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
 	testCases := []struct {
 		input        string
 		expectedRoot string
@@ -521,7 +529,8 @@ func TestNewBasicFilesystem(t *testing.T) {
 	}{
 		{"/foo/bar/baz", "/foo/bar/baz", "/foo/bar/baz"},
 		{"/foo/bar/baz/", "/foo/bar/baz", "/foo/bar/baz"},
-		{"", "/", "/"},
+		{"", currentDir, currentDir},
+		{".", currentDir, currentDir},
 		{"/", "/", "/"},
 	}
 
@@ -571,4 +580,16 @@ func TestBasicWalkSkipSymlink(t *testing.T) {
 	_, dir := setup(t)
 	defer os.RemoveAll(dir)
 	testWalkSkipSymlink(t, FilesystemTypeBasic, dir)
+}
+
+func TestWalkTraverseDirJunct(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkTraverseDirJunct(t, FilesystemTypeBasic, dir)
+}
+
+func TestWalkInfiniteRecursion(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkInfiniteRecursion(t, FilesystemTypeBasic, dir)
 }

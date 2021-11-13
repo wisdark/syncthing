@@ -78,7 +78,7 @@
                     <option value="-1" translate>Disabled</option>
                   </select>
                 </div>
-                <p class="help-block" ng-if="tmpOptions.upgrades == 'candidate' || version.isCandidate"">
+                <p class="help-block" ng-if="tmpOptions.upgrades == 'candidate' || version.isCandidate">
                   <span translate>Usage reporting is always enabled for candidate releases.</span>
                 </p>
               </div>
@@ -94,19 +94,21 @@
                 <p class="help-block" ng-if="!upgradeInfo">
                   <span translate>Unavailable/Disabled by administrator or maintainer</span>
                 </p>
-                <p class="help-block" ng-if="version.isCandidate && upgradeInfo"">
+                <p class="help-block" ng-if="version.isCandidate && upgradeInfo">
                   <span translate>Automatic upgrades are always enabled for candidate releases.</span>
                 </p>
               </div>
             </div>
           </div>
-          <div class="form-group">
-            <label translate for="urVersion">Default Folder Path</label>
-            <input id="DefaultFolderPath" class="form-control" type="text" ng-model="tmpOptions.defaultFolderPath" />
-            <p class="help-block">
-              <span translate translate-value-tilde="{{system.tilde}}">
-                Path where new auto accepted folders will be created, as well as the default suggested path when adding new folders via the UI. Tilde character (~) expands to {%tilde%}.
-              </span>
+          <div>
+            <label translate>Default Configuration</label>
+            <p>
+              <button type="button" class="btn btn-default btn-secondary" ng-click="editFolderDefaults()">
+                <span translate>Edit Folder Defaults</span>
+              </button>
+              <button type="button" class="btn btn-default btn-secondary" ng-click="editDeviceDefaults()">
+                <span translate>Edit Device Defaults</span>
+              </button>
             </p>
           </div>
         </div>

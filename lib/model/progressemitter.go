@@ -11,18 +11,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/thejerf/suture"
-
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
 )
 
 type ProgressEmitter struct {
-	suture.Service
-
 	cfg                config.Wrapper
 	registry           map[string]map[string]*sharedPullerState // folder: name: puller
 	interval           time.Duration
@@ -35,6 +30,16 @@ type ProgressEmitter struct {
 	mut                sync.Mutex
 
 	timer *time.Timer
+}
+
+type progressUpdate struct {
+	conn    protocol.Connection
+	folder  string
+	updates []protocol.FileDownloadProgressUpdate
+}
+
+func (p progressUpdate) send(ctx context.Context) {
+	p.conn.DownloadProgress(ctx, p.folder, p.updates)
 }
 
 // NewProgressEmitter creates a new progress emitter which emits
@@ -50,7 +55,6 @@ func NewProgressEmitter(cfg config.Wrapper, evLogger events.Logger) *ProgressEmi
 		evLogger:           evLogger,
 		mut:                sync.NewMutex(),
 	}
-	t.Service = util.AsService(t.serve, t.String())
 
 	t.CommitConfiguration(config.Configuration{}, cfg.RawCopy())
 
@@ -59,7 +63,7 @@ func NewProgressEmitter(cfg config.Wrapper, evLogger events.Logger) *ProgressEmi
 
 // serve starts the progress emitter which starts emitting DownloadProgress
 // events as the progress happens.
-func (t *ProgressEmitter) serve(ctx context.Context) {
+func (t *ProgressEmitter) Serve(ctx context.Context) error {
 	t.cfg.Subscribe(t)
 	defer t.cfg.Unsubscribe(t)
 
@@ -69,13 +73,14 @@ func (t *ProgressEmitter) serve(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			l.Debugln("progress emitter: stopping")
-			return
+			return nil
 		case <-t.timer.C:
 			t.mut.Lock()
 			l.Debugln("progress emitter: timer - looking after", len(t.registry))
 
 			newLastUpdated := lastUpdate
 			newCount = t.lenRegistryLocked()
+			var progressUpdates []progressUpdate
 			for _, pullers := range t.registry {
 				for _, puller := range pullers {
 					if updated := puller.Updated(); updated.After(newLastUpdated) {
@@ -88,9 +93,7 @@ func (t *ProgressEmitter) serve(ctx context.Context) {
 				lastUpdate = newLastUpdated
 				lastCount = newCount
 				t.sendDownloadProgressEventLocked()
-				if len(t.connections) > 0 {
-					t.sendDownloadProgressMessagesLocked(ctx)
-				}
+				progressUpdates = t.computeProgressUpdates()
 			} else {
 				l.Debugln("progress emitter: nothing new")
 			}
@@ -99,6 +102,17 @@ func (t *ProgressEmitter) serve(ctx context.Context) {
 				t.timer.Reset(t.interval)
 			}
 			t.mut.Unlock()
+
+			// Do the sending outside of the lock.
+			// If these send block, the whole process of reporting progress to others stops, but that's probably fine.
+			// It's better to stop this component from working under back-pressure than causing other components that
+			// rely on this component to be waiting for locks.
+			//
+			// This might leave remote peers in some funky state where we are unable the fact that we no longer have
+			// something, but there is not much we can do here.
+			for _, update := range progressUpdates {
+				update.send(ctx)
+			}
 		}
 	}
 }
@@ -118,7 +132,8 @@ func (t *ProgressEmitter) sendDownloadProgressEventLocked() {
 	l.Debugf("progress emitter: emitting %#v", output)
 }
 
-func (t *ProgressEmitter) sendDownloadProgressMessagesLocked(ctx context.Context) {
+func (t *ProgressEmitter) computeProgressUpdates() []progressUpdate {
+	var progressUpdates []progressUpdate
 	for id, conn := range t.connections {
 		for _, folder := range t.foldersByConns[id] {
 			pullers, ok := t.registry[folder]
@@ -149,7 +164,11 @@ func (t *ProgressEmitter) sendDownloadProgressMessagesLocked(ctx context.Context
 			updates := state.update(folder, activePullers)
 
 			if len(updates) > 0 {
-				conn.DownloadProgress(ctx, folder, updates)
+				progressUpdates = append(progressUpdates, progressUpdate{
+					conn:    conn,
+					folder:  folder,
+					updates: updates,
+				})
 			}
 		}
 	}
@@ -189,6 +208,8 @@ func (t *ProgressEmitter) sendDownloadProgressMessagesLocked(ctx context.Context
 			// }
 		}
 	}
+
+	return progressUpdates
 }
 
 // VerifyConfiguration implements the config.Committer interface

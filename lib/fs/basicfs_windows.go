@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build windows
 // +build windows
 
 package fs
@@ -11,7 +12,6 @@ package fs
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,7 +137,7 @@ func (f *BasicFilesystem) Roots() ([]string, error) {
 
 	hr, _, _ := getLogicalDriveStringsHandle.Call(uintptr(unsafe.Pointer(&bufferSize)), uintptr(unsafe.Pointer(&buffer)))
 	if hr == 0 {
-		return nil, fmt.Errorf("Syscall failed")
+		return nil, errors.New("syscall failed")
 	}
 
 	var drives []string
@@ -158,9 +158,9 @@ func (f *BasicFilesystem) Roots() ([]string, error) {
 // pathseparator.
 func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (string, error) {
 	absPath = f.resolveWin83(absPath)
-	lowerAbsPath := UnicodeLowercase(absPath)
+	lowerAbsPath := UnicodeLowercaseNormalized(absPath)
 	for _, root := range roots {
-		lowerRoot := UnicodeLowercase(root)
+		lowerRoot := UnicodeLowercaseNormalized(root)
 		if lowerAbsPath+string(PathSeparator) == lowerRoot {
 			return ".", nil
 		}
@@ -172,7 +172,7 @@ func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (strin
 }
 
 func rel(path, prefix string) string {
-	lowerRel := strings.TrimPrefix(strings.TrimPrefix(UnicodeLowercase(path), UnicodeLowercase(prefix)), string(PathSeparator))
+	lowerRel := strings.TrimPrefix(strings.TrimPrefix(UnicodeLowercaseNormalized(path), UnicodeLowercaseNormalized(prefix)), string(PathSeparator))
 	return path[len(path)-len(lowerRel):]
 }
 
@@ -194,8 +194,8 @@ func (f *BasicFilesystem) resolveWin83(absPath string) string {
 	}
 	// Failed getting the long path. Return the part of the path which is
 	// already a long path.
-	lowerRoot := UnicodeLowercase(f.root)
-	for absPath = filepath.Dir(absPath); strings.HasPrefix(UnicodeLowercase(absPath), lowerRoot); absPath = filepath.Dir(absPath) {
+	lowerRoot := UnicodeLowercaseNormalized(f.root)
+	for absPath = filepath.Dir(absPath); strings.HasPrefix(UnicodeLowercaseNormalized(absPath), lowerRoot); absPath = filepath.Dir(absPath) {
 		if !isMaybeWin83(absPath) {
 			return absPath
 		}

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -25,7 +26,6 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
-	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sha256"
 	"golang.org/x/text/unicode/norm"
@@ -39,17 +39,19 @@ type testfile struct {
 
 type testfileList []testfile
 
-var testFs fs.Filesystem
-
-var testdata = testfileList{
-	{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
-	{"dir1", 128, ""},
-	{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
-	{"dir2", 128, ""},
-	{filepath.Join("dir2", "cfile"), 4, "bf07a7fbb825fc0aae7bf4a1177b2b31fcf8a3feeaf7092761e18c859ee52a9c"},
-	{"excludes", 37, "df90b52f0c55dba7a7a940affe482571563b1ac57bd5be4d8a0291e7de928e06"},
-	{"further-excludes", 5, "7eb0a548094fa6295f7fd9200d69973e5f5ec5c04f2a86d998080ac43ecf89f1"},
-}
+var (
+	testFs     fs.Filesystem
+	testFsType = fs.FilesystemTypeBasic
+	testdata   = testfileList{
+		{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
+		{"dir1", 128, ""},
+		{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
+		{"dir2", 128, ""},
+		{filepath.Join("dir2", "cfile"), 4, "bf07a7fbb825fc0aae7bf4a1177b2b31fcf8a3feeaf7092761e18c859ee52a9c"},
+		{"excludes", 37, "df90b52f0c55dba7a7a940affe482571563b1ac57bd5be4d8a0291e7de928e06"},
+		{"further-excludes", 5, "7eb0a548094fa6295f7fd9200d69973e5f5ec5c04f2a86d998080ac43ecf89f1"},
+	}
+)
 
 func init() {
 	// This test runs the risk of entering infinite recursion if it fails.
@@ -67,7 +69,8 @@ func TestWalkSub(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Subs = []string{"dir2"}
 	cfg.Matcher = ignores
 	fchan := Walk(context.TODO(), cfg)
@@ -101,7 +104,8 @@ func TestWalk(t *testing.T) {
 	}
 	t.Log(ignores)
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Matcher = ignores
 	fchan := Walk(context.TODO(), cfg)
 
@@ -247,6 +251,62 @@ func TestNormalization(t *testing.T) {
 	}
 }
 
+func TestNormalizationDarwinCaseFS(t *testing.T) {
+	// This tests that normalization works on Darwin, through a CaseFS.
+
+	if runtime.GOOS != "darwin" {
+		t.Skip("Normalization test not possible on non-Darwin")
+		return
+	}
+
+	testFs := fs.NewCaseFilesystem(testFs)
+
+	testFs.RemoveAll("normalization")
+	defer testFs.RemoveAll("normalization")
+	testFs.MkdirAll("normalization", 0755)
+
+	const (
+		inNFC = "\xC3\x84"
+		inNFD = "\x41\xCC\x88"
+	)
+
+	// Create dir in NFC
+	if err := testFs.Mkdir(filepath.Join("normalization", "dir-"+inNFC), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create file in NFC
+	fd, err := testFs.Create(filepath.Join("normalization", "dir-"+inNFC, "file-"+inNFC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.Close()
+
+	// Walk, which should normalize and return
+	walkDir(testFs, "normalization", nil, nil, 0)
+	tmp := walkDir(testFs, "normalization", nil, nil, 0)
+	if len(tmp) != 3 {
+		t.Error("Expected one file and one dir scanned")
+	}
+
+	// Verify we see the normalized entries in the result
+	foundFile := false
+	foundDir := false
+	for _, f := range tmp {
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD) {
+			foundDir = true
+			continue
+		}
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD, "file-"+inNFD) {
+			foundFile = true
+			continue
+		}
+	}
+	if !foundFile || !foundDir {
+		t.Error("Didn't find expected normalization form")
+	}
+}
+
 func TestIssue1507(t *testing.T) {
 	w := &walker{}
 	w.Matcher = ignore.New(w.Filesystem)
@@ -269,7 +329,7 @@ func TestWalkSymlinkUnix(t *testing.T) {
 	defer os.RemoveAll("_symlinks")
 	os.Symlink("../testdata", "_symlinks/link")
 
-	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, "_symlinks")
+	fs := fs.NewFilesystem(testFsType, "_symlinks")
 	for _, path := range []string{".", "link"} {
 		// Scan it
 		files := walkDir(fs, path, nil, nil, 0)
@@ -297,15 +357,15 @@ func TestWalkSymlinkWindows(t *testing.T) {
 	os.RemoveAll(name)
 	os.Mkdir(name, 0755)
 	defer os.RemoveAll(name)
-	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, name)
-	if err := osutil.DebugSymlinkForTestsOnly("../testdata", "_symlinks/link"); err != nil {
+	testFs := fs.NewFilesystem(testFsType, name)
+	if err := fs.DebugSymlinkForTestsOnly(testFs, testFs, "../testdata", "link"); err != nil {
 		// Probably we require permissions we don't have.
 		t.Skip(err)
 	}
 
 	for _, path := range []string{".", "link"} {
 		// Scan it
-		files := walkDir(fs, path, nil, nil, 0)
+		files := walkDir(testFs, path, nil, nil, 0)
 
 		// Verify that we got zero symlinks
 		if len(files) != 0 {
@@ -321,10 +381,12 @@ func TestWalkRootSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
+	testFs := fs.NewFilesystem(testFsType, tmp)
 
-	link := filepath.Join(tmp, "link")
+	link := "link"
 	dest, _ := filepath.Abs("testdata/dir1")
-	if err := osutil.DebugSymlinkForTestsOnly(dest, link); err != nil {
+	destFs := fs.NewFilesystem(testFsType, dest)
+	if err := fs.DebugSymlinkForTestsOnly(destFs, testFs, ".", "link"); err != nil {
 		if runtime.GOOS == "windows" {
 			// Probably we require permissions we don't have.
 			t.Skip("Need admin permissions or developer mode to run symlink test on Windows: " + err.Error())
@@ -334,15 +396,15 @@ func TestWalkRootSymlink(t *testing.T) {
 	}
 
 	// Scan root with symlink at FS root
-	files := walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, link), ".", nil, nil, 0)
+	files := walkDir(fs.NewFilesystem(testFsType, filepath.Join(testFs.URI(), link)), ".", nil, nil, 0)
 
 	// Verify that we got two files
 	if len(files) != 2 {
-		t.Errorf("expected two files, not %d", len(files))
+		t.Fatalf("expected two files, not %d", len(files))
 	}
 
 	// Scan symlink below FS root
-	files = walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, tmp), "link", nil, nil, 0)
+	files = walkDir(testFs, "link", nil, nil, 0)
 
 	// Verify that we got the one symlink, except on windows
 	if runtime.GOOS == "windows" {
@@ -354,7 +416,7 @@ func TestWalkRootSymlink(t *testing.T) {
 	}
 
 	// Scan path below symlink
-	files = walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, tmp), filepath.Join("link", "cfile"), nil, nil, 0)
+	files = walkDir(fs.NewFilesystem(testFsType, tmp), filepath.Join("link", "cfile"), nil, nil, 0)
 
 	// Verify that we get nothing
 	if len(files) != 0 {
@@ -483,7 +545,8 @@ func TestWalkReceiveOnly(t *testing.T) {
 }
 
 func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.Matcher, localFlags uint32) []protocol.FileInfo {
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Filesystem = fs
 	cfg.Subs = []string{dir}
 	cfg.AutoNormalize = true
@@ -544,7 +607,7 @@ func (l testfileList) String() string {
 var initOnce sync.Once
 
 const (
-	testdataSize = 17 << 20
+	testdataSize = 17<<20 + 1
 	testdataName = "_random.data"
 )
 
@@ -553,7 +616,7 @@ func BenchmarkHashFile(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := HashFile(context.TODO(), fs.NewFilesystem(fs.FilesystemTypeBasic, ""), testdataName, protocol.MinBlockSize, nil, true); err != nil {
+		if _, err := HashFile(context.TODO(), fs.NewFilesystem(testFsType, ""), testdataName, protocol.MinBlockSize, nil, true); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -592,7 +655,8 @@ func TestStopWalk(t *testing.T) {
 
 	const numHashers = 4
 	ctx, cancel := context.WithCancel(context.Background())
-	cfg := testConfig()
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
 	cfg.Filesystem = fs
 	cfg.Hashers = numHashers
 	cfg.ProgressTickIntervalS = -1 // Don't attempt to build the full list of files before starting to scan...
@@ -651,7 +715,7 @@ func TestIssue4799(t *testing.T) {
 	}
 	defer os.RemoveAll(tmp)
 
-	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, tmp)
+	fs := fs.NewFilesystem(testFsType, tmp)
 
 	fd, err := fs.Create("foo")
 	if err != nil {
@@ -713,7 +777,7 @@ func TestIssue4841(t *testing.T) {
 	}
 	defer os.RemoveAll(tmp)
 
-	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, tmp)
+	fs := fs.NewFilesystem(testFsType, tmp)
 
 	fd, err := fs.Create("foo")
 	if err != nil {
@@ -721,7 +785,8 @@ func TestIssue4841(t *testing.T) {
 	}
 	fd.Close()
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Filesystem = fs
 	cfg.AutoNormalize = true
 	cfg.CurrentFiler = fakeCurrentFiler{"foo": {
@@ -757,7 +822,8 @@ func TestNotExistingError(t *testing.T) {
 		t.Fatalf("Lstat returned error %v, while nothing should exist there.", err)
 	}
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Subs = []string{sub}
 	fchan := Walk(context.TODO(), cfg)
 	for f := range fchan {
@@ -766,16 +832,10 @@ func TestNotExistingError(t *testing.T) {
 }
 
 func TestSkipIgnoredDirs(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
-
-	fss := fs.NewFilesystem(fs.FilesystemTypeBasic, tmp)
+	fss := fs.NewFilesystem(fs.FilesystemTypeFake, "")
 
 	name := "foo/ignored"
-	err = fss.MkdirAll(name, 0777)
+	err := fss.MkdirAll(name, 0777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,6 +870,50 @@ func TestSkipIgnoredDirs(t *testing.T) {
 	}
 }
 
+// https://github.com/syncthing/syncthing/issues/6487
+func TestIncludedSubdir(t *testing.T) {
+	fss := fs.NewFilesystem(fs.FilesystemTypeFake, "")
+
+	name := filepath.Clean("foo/bar/included")
+	err := fss.MkdirAll(name, 0777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pats := ignore.New(fss, ignore.WithCache(true))
+
+	stignore := `
+	!/foo/bar
+	*
+	`
+	if err := pats.Parse(bytes.NewBufferString(stignore), ".stignore"); err != nil {
+		t.Fatal(err)
+	}
+
+	fchan := Walk(context.TODO(), Config{
+		CurrentFiler: make(fakeCurrentFiler),
+		Filesystem:   fss,
+		Matcher:      pats,
+	})
+
+	found := false
+	for f := range fchan {
+		if f.Err != nil {
+			t.Fatalf("Error while scanning %v: %v", f.Err, f.Path)
+		}
+		if f.File.IsIgnored() {
+			t.Error("File is ignored:", f.File.Name)
+		}
+		if f.File.Name == name {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Errorf("File not present in scan results")
+	}
+}
+
 // Verify returns nil or an error describing the mismatch between the block
 // list and actual reader contents
 func verify(r io.Reader, blocksize int, blocks []protocol.BlockInfo) error {
@@ -836,7 +940,7 @@ func verify(r io.Reader, blocksize int, blocks []protocol.BlockInfo) error {
 	bs := make([]byte, 1)
 	n, err := r.Read(bs)
 	if n != 0 || err != io.EOF {
-		return fmt.Errorf("file continues past end of blocks")
+		return errors.New("file continues past end of blocks")
 	}
 
 	return nil
@@ -849,12 +953,13 @@ func (fcf fakeCurrentFiler) CurrentFile(name string) (protocol.FileInfo, bool) {
 	return f, ok
 }
 
-func testConfig() Config {
+func testConfig() (Config, context.CancelFunc) {
 	evLogger := events.NewLogger()
-	go evLogger.Serve()
+	ctx, cancel := context.WithCancel(context.Background())
+	go evLogger.Serve(ctx)
 	return Config{
 		Filesystem:  testFs,
 		Hashers:     2,
 		EventLogger: evLogger,
-	}
+	}, cancel
 }

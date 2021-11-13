@@ -3,6 +3,7 @@
 package protocol
 
 import (
+	"errors"
 	"fmt"
 	"io"
 )
@@ -53,7 +54,7 @@ func WriteMessage(w io.Writer, message interface{}) error {
 		payload, err = msg.MarshalXDR()
 		header.messageType = messageTypeRelayFull
 	default:
-		err = fmt.Errorf("Unknown message type")
+		err = errors.New("unknown message type")
 	}
 
 	if err != nil {
@@ -84,7 +85,10 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 	}
 
 	if header.magic != magic {
-		return nil, fmt.Errorf("magic mismatch")
+		return nil, errors.New("magic mismatch")
+	}
+	if header.messageLength < 0 || header.messageLength > 1024 {
+		return nil, fmt.Errorf("bad length (%d)", header.messageLength)
 	}
 
 	buf = make([]byte, int(header.messageLength))
@@ -127,5 +131,5 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 		return msg, err
 	}
 
-	return nil, fmt.Errorf("Unknown message type")
+	return nil, errors.New("unknown message type")
 }

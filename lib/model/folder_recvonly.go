@@ -13,9 +13,9 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/events"
-	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/util"
 	"github.com/syncthing/syncthing/lib/versioner"
 )
 
@@ -26,7 +26,7 @@ func init() {
 /*
 receiveOnlyFolder is a folder that does not propagate local changes outward.
 It does this by the following general mechanism (not all of which is
-implemted in this file):
+implemented in this file):
 
 - Local changes are scanned and versioned as usual, but get the
   FlagLocalReceiveOnly bit set.
@@ -57,13 +57,19 @@ type receiveOnlyFolder struct {
 	*sendReceiveFolder
 }
 
-func newReceiveOnlyFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, fs fs.Filesystem, evLogger events.Logger, ioLimiter *byteSemaphore) service {
-	sr := newSendReceiveFolder(model, fset, ignores, cfg, ver, fs, evLogger, ioLimiter).(*sendReceiveFolder)
+func newReceiveOnlyFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *util.Semaphore) service {
+	sr := newSendReceiveFolder(model, fset, ignores, cfg, ver, evLogger, ioLimiter).(*sendReceiveFolder)
 	sr.localFlags = protocol.FlagLocalReceiveOnly // gets propagated to the scanner, and set on locally changed files
 	return &receiveOnlyFolder{sr}
 }
 
 func (f *receiveOnlyFolder) Revert() {
+	f.doInSync(f.revert)
+}
+
+func (f *receiveOnlyFolder) revert() error {
+	l.Infof("Reverting folder %v", f.Description)
+
 	f.setState(FolderScanning)
 	defer f.setState(FolderIdle)
 
@@ -77,11 +83,16 @@ func (f *receiveOnlyFolder) Revert() {
 		scanChan: scanChan,
 	}
 
-	batch := make([]protocol.FileInfo, 0, maxBatchSizeFiles)
-	batchSizeBytes := 0
-	snap := f.fset.Snapshot()
+	batch := db.NewFileInfoBatch(func(files []protocol.FileInfo) error {
+		f.updateLocalsFromScanning(files)
+		return nil
+	})
+	snap, err := f.dbSnapshot()
+	if err != nil {
+		return err
+	}
 	defer snap.Release()
-	snap.WithHave(protocol.LocalDeviceID, func(intf db.FileIntf) bool {
+	snap.WithHave(protocol.LocalDeviceID, func(intf protocol.FileIntf) bool {
 		fi := intf.(protocol.FileInfo)
 		if !fi.IsReceiveOnlyChanged() {
 			// We're only interested in files that have changed locally in
@@ -89,12 +100,22 @@ func (f *receiveOnlyFolder) Revert() {
 			return true
 		}
 
-		if len(fi.Version.Counters) == 1 && fi.Version.Counters[0].ID == f.shortID {
-			// We are the only device mentioned in the version vector so the
-			// file must originate here. A revert then means to delete it.
+		fi.LocalFlags &^= protocol.FlagLocalReceiveOnly
+
+		switch gf, ok := snap.GetGlobal(fi.Name); {
+		case !ok:
+			msg := "Unexpected global file that we have locally"
+			l.Debugf("%v revert: %v: %v", f, msg, fi.Name)
+			f.evLogger.Log(events.Failure, msg)
+			return true
+		case gf.IsReceiveOnlyChanged():
+			// The global file is our own. A revert then means to delete it.
 			// We'll delete files directly, directories get queued and
 			// handled below.
-
+			if fi.Deleted {
+				fi.Version = protocol.Vector{} // if this file ever resurfaces anywhere we want our delete to be strictly older
+				break
+			}
 			handled, err := delQueue.handle(fi, snap)
 			if err != nil {
 				l.Infof("Revert: deleting %s: %v\n", fi.Name, err)
@@ -103,34 +124,26 @@ func (f *receiveOnlyFolder) Revert() {
 			if !handled {
 				return true // continue
 			}
-
 			fi.SetDeleted(f.shortID)
 			fi.Version = protocol.Vector{} // if this file ever resurfaces anywhere we want our delete to be strictly older
-		} else {
+		case gf.IsEquivalentOptional(fi, f.modTimeWindow, false, false, protocol.FlagLocalReceiveOnly):
+			// What we have locally is equivalent to the global file.
+			fi = gf
+		default:
 			// Revert means to throw away our local changes. We reset the
 			// version to the empty vector, which is strictly older than any
 			// other existing version. It is not in conflict with anything,
 			// either, so we will not create a conflict copy of our local
 			// changes.
 			fi.Version = protocol.Vector{}
-			fi.LocalFlags &^= protocol.FlagLocalReceiveOnly
 		}
 
-		batch = append(batch, fi)
-		batchSizeBytes += fi.ProtoSize()
+		batch.Append(fi)
+		_ = batch.FlushIfFull()
 
-		if len(batch) >= maxBatchSizeFiles || batchSizeBytes >= maxBatchSizeBytes {
-			f.updateLocalsFromScanning(batch)
-			batch = batch[:0]
-			batchSizeBytes = 0
-		}
 		return true
 	})
-	if len(batch) > 0 {
-		f.updateLocalsFromScanning(batch)
-	}
-	batch = batch[:0]
-	batchSizeBytes = 0
+	_ = batch.Flush()
 
 	// Handle any queued directories
 	deleted, err := delQueue.flush(snap)
@@ -139,7 +152,7 @@ func (f *receiveOnlyFolder) Revert() {
 	}
 	now := time.Now()
 	for _, dir := range deleted {
-		batch = append(batch, protocol.FileInfo{
+		batch.Append(protocol.FileInfo{
 			Name:       dir,
 			Type:       protocol.FileInfoTypeDirectory,
 			ModifiedS:  now.Unix(),
@@ -148,14 +161,14 @@ func (f *receiveOnlyFolder) Revert() {
 			Version:    protocol.Vector{},
 		})
 	}
-	if len(batch) > 0 {
-		f.updateLocalsFromScanning(batch)
-	}
+	_ = batch.Flush()
 
 	// We will likely have changed our local index, but that won't trigger a
 	// pull by itself. Make sure we schedule one so that we start
 	// downloading files.
 	f.SchedulePull()
+
+	return nil
 }
 
 // deleteQueue handles deletes by delegating to a handler and queuing

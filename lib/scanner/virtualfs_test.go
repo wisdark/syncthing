@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,7 +42,7 @@ func (i infiniteFS) DirNames(name string) ([]string, error) {
 	for j := 0; j < i.width; j++ {
 		names = append(names, fmt.Sprintf("aa-file-%d", j))
 	}
-	if len(strings.Split(name, string(os.PathSeparator))) < i.depth {
+	if len(fs.PathComponents(name)) < i.depth {
 		for j := 0; j < i.width; j++ {
 			names = append(names, fmt.Sprintf("zz-dir-%d", j))
 		}
@@ -97,6 +96,10 @@ func (s singleFileFS) Open(name string) (fs.File, error) {
 	return &fakeFile{s.name, s.filesize, 0}, nil
 }
 
+func (s singleFileFS) Options() []fs.Option {
+	return nil
+}
+
 type fakeInfo struct {
 	name string
 	size int64
@@ -106,11 +109,13 @@ func (f fakeInfo) Name() string       { return f.name }
 func (f fakeInfo) Mode() fs.FileMode  { return 0755 }
 func (f fakeInfo) Size() int64        { return f.size }
 func (f fakeInfo) ModTime() time.Time { return time.Unix(1234567890, 0) }
-func (f fakeInfo) IsDir() bool        { return strings.Contains(filepath.Base(f.name), "dir") || f.name == "." }
-func (f fakeInfo) IsRegular() bool    { return !f.IsDir() }
-func (f fakeInfo) IsSymlink() bool    { return false }
-func (f fakeInfo) Owner() int         { return 0 }
-func (f fakeInfo) Group() int         { return 0 }
+func (f fakeInfo) IsDir() bool {
+	return strings.Contains(filepath.Base(f.name), "dir") || f.name == "."
+}
+func (f fakeInfo) IsRegular() bool { return !f.IsDir() }
+func (f fakeInfo) IsSymlink() bool { return false }
+func (f fakeInfo) Owner() int      { return 0 }
+func (f fakeInfo) Group() int      { return 0 }
 
 type fakeFile struct {
 	name       string

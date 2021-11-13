@@ -13,10 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-
-	"github.com/syncthing/syncthing/lib/sync"
-
-	"github.com/thejerf/suture"
+	"time"
 )
 
 type defaultParser interface {
@@ -56,14 +53,14 @@ func SetDefaults(data interface{}) {
 			case string:
 				f.SetString(v)
 
-			case int:
+			case int, uint32, int32, int64, uint64:
 				i, err := strconv.ParseInt(v, 10, 64)
 				if err != nil {
 					panic(err)
 				}
 				f.SetInt(i)
 
-			case float64:
+			case float64, float32:
 				i, err := strconv.ParseFloat(v, 64)
 				if err != nil {
 					panic(err)
@@ -80,6 +77,10 @@ func SetDefaults(data interface{}) {
 
 			default:
 				panic(f.Type())
+			}
+		} else if f.CanSet() && f.Kind() == reflect.Struct && f.CanAddr() {
+			if addr := f.Addr(); addr.CanInterface() {
+				SetDefaults(addr.Interface())
 			}
 		}
 	}
@@ -115,16 +116,14 @@ func CopyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy fu
 	}
 }
 
-// UniqueTrimmedStrings returns a list on unique strings, trimming at the same time.
+// UniqueTrimmedStrings returns a list of all unique strings in ss,
+// in the order in which they first appear in ss, after trimming away
+// leading and trailing spaces.
 func UniqueTrimmedStrings(ss []string) []string {
-	// Trim all first
-	for i, v := range ss {
-		ss[i] = strings.Trim(v, " ")
-	}
-
 	var m = make(map[string]struct{}, len(ss))
 	var us = make([]string, 0, len(ss))
 	for _, v := range ss {
+		v = strings.Trim(v, " ")
 		if _, ok := m[v]; ok {
 			continue
 		}
@@ -133,6 +132,61 @@ func UniqueTrimmedStrings(ss []string) []string {
 	}
 
 	return us
+}
+
+func FillNilExceptDeprecated(data interface{}) {
+	fillNil(data, true)
+}
+
+func FillNil(data interface{}) {
+	fillNil(data, false)
+}
+
+func fillNil(data interface{}, skipDeprecated bool) {
+	s := reflect.ValueOf(data).Elem()
+	t := s.Type()
+	for i := 0; i < s.NumField(); i++ {
+		if skipDeprecated && strings.HasPrefix(t.Field(i).Name, "Deprecated") {
+			continue
+		}
+
+		f := s.Field(i)
+
+		for f.Kind() == reflect.Ptr && f.IsZero() && f.CanSet() {
+			newValue := reflect.New(f.Type().Elem())
+			f.Set(newValue)
+			f = f.Elem()
+		}
+
+		if f.CanSet() {
+			if f.IsZero() {
+				switch f.Kind() {
+				case reflect.Map:
+					f.Set(reflect.MakeMap(f.Type()))
+				case reflect.Slice:
+					f.Set(reflect.MakeSlice(f.Type(), 0, 0))
+				case reflect.Chan:
+					f.Set(reflect.MakeChan(f.Type(), 0))
+				}
+			}
+
+			switch f.Kind() {
+			case reflect.Slice:
+				if f.Type().Elem().Kind() != reflect.Struct {
+					continue
+				}
+				for i := 0; i < f.Len(); i++ {
+					fillNil(f.Index(i).Addr().Interface(), skipDeprecated)
+				}
+			case reflect.Struct:
+				if f.CanAddr() {
+					if addr := f.Addr(); addr.CanInterface() {
+						fillNil(addr.Interface(), skipDeprecated)
+					}
+				}
+			}
+		}
+	}
 }
 
 // FillNilSlices sets default value on slices that are still nil.
@@ -176,101 +230,45 @@ func Address(network, host string) string {
 	return u.String()
 }
 
-// AsService wraps the given function to implement suture.Service by calling
-// that function on serve and closing the passed channel when Stop is called.
-func AsService(fn func(ctx context.Context), creator string) suture.Service {
-	return asServiceWithError(func(ctx context.Context) error {
-		fn(ctx)
-		return nil
-	}, creator)
-}
-
-type ServiceWithError interface {
-	suture.Service
-	fmt.Stringer
-	Error() error
-	SetError(error)
-}
-
-// AsServiceWithError does the same as AsService, except that it keeps track
-// of an error returned by the given function.
-func AsServiceWithError(fn func(ctx context.Context) error, creator string) ServiceWithError {
-	return asServiceWithError(fn, creator)
-}
-
-func asServiceWithError(fn func(ctx context.Context) error, creator string) ServiceWithError {
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &service{
-		serve:   fn,
-		ctx:     ctx,
-		cancel:  cancel,
-		stopped: make(chan struct{}),
-		creator: creator,
-		mut:     sync.NewMutex(),
-	}
-	close(s.stopped) // not yet started, don't block on Stop()
-	return s
-}
-
-type service struct {
-	creator string
-	serve   func(ctx context.Context) error
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopped chan struct{}
-	err     error
-	mut     sync.Mutex
-}
-
-func (s *service) Serve() {
-	s.mut.Lock()
-	select {
-	case <-s.ctx.Done():
-		s.mut.Unlock()
-		return
-	default:
-	}
-	s.err = nil
-	s.stopped = make(chan struct{})
-	s.mut.Unlock()
-
+func CallWithContext(ctx context.Context, fn func() error) error {
 	var err error
-	defer func() {
-		if err == context.Canceled {
-			err = nil
-		}
-		s.mut.Lock()
-		s.err = err
-		close(s.stopped)
-		s.mut.Unlock()
+	done := make(chan struct{})
+	go func() {
+		err = fn()
+		close(done)
 	}()
-	err = s.serve(s.ctx)
-}
-
-func (s *service) Stop() {
-	s.mut.Lock()
 	select {
-	case <-s.ctx.Done():
-		panic(fmt.Sprintf("Stop called more than once on %v", s))
-	default:
-		s.cancel()
+	case <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	s.mut.Unlock()
-	<-s.stopped
 }
 
-func (s *service) Error() error {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	return s.err
+func NiceDurationString(d time.Duration) string {
+	switch {
+	case d > 24*time.Hour:
+		d = d.Round(time.Hour)
+	case d > time.Hour:
+		d = d.Round(time.Minute)
+	case d > time.Minute:
+		d = d.Round(time.Second)
+	case d > time.Second:
+		d = d.Round(time.Millisecond)
+	case d > time.Millisecond:
+		d = d.Round(time.Microsecond)
+	}
+	return d.String()
 }
 
-func (s *service) SetError(err error) {
-	s.mut.Lock()
-	s.err = err
-	s.mut.Unlock()
-}
-
-func (s *service) String() string {
-	return fmt.Sprintf("Service@%p created by %v", s, s.creator)
+func EqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
