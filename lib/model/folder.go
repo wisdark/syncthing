@@ -103,7 +103,7 @@ func newFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg conf
 		shortID:       model.shortID,
 		fset:          fset,
 		ignores:       ignores,
-		mtimefs:       fset.MtimeFS(),
+		mtimefs:       fset.MtimeFS(cfg.Filesystem()),
 		modTimeWindow: cfg.ModTimeWindow(),
 		done:          make(chan struct{}),
 
@@ -329,7 +329,7 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 	dbPath := locations.Get(locations.Database)
 	if usage, err := fs.NewFilesystem(fs.FilesystemTypeBasic, dbPath).Usage("."); err == nil {
 		if err = config.CheckFreeSpace(f.model.cfg.Options().MinHomeDiskFree, usage); err != nil {
-			return errors.Wrapf(err, "insufficient space on disk for database (%v)", dbPath)
+			return fmt.Errorf("insufficient space on disk for database (%v): %w", dbPath, err)
 		}
 	}
 
