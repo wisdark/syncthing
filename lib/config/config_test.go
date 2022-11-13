@@ -23,6 +23,7 @@ import (
 
 	"github.com/d4l3k/messagediff"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -62,7 +63,6 @@ func TestDefaultValues(t *testing.T) {
 			NATLeaseM:               60,
 			NATRenewalM:             30,
 			NATTimeoutS:             10,
-			RestartOnWakeup:         true,
 			AutoUpgradeIntervalH:    12,
 			KeepTemporariesH:        24,
 			CacheIgnoredFiles:       false,
@@ -106,6 +106,11 @@ func TestDefaultValues(t *testing.T) {
 				WeakHashThresholdPct: 25,
 				MarkerName:           ".stfolder",
 				MaxConcurrentWrites:  2,
+				XattrFilter: XattrFilter{
+					Entries:            []XattrFilterEntry{},
+					MaxSingleEntrySize: 1024,
+					MaxTotalSize:       4096,
+				},
 			},
 			Device: DeviceConfiguration{
 				Addresses:       []string{"dynamic"},
@@ -177,6 +182,9 @@ func TestDeviceConfig(t *testing.T) {
 				MarkerName:           DefaultMarkerName,
 				JunctionsAsDirs:      true,
 				MaxConcurrentWrites:  maxConcurrentWritesDefault,
+				XattrFilter: XattrFilter{
+					Entries: []XattrFilterEntry{},
+				},
 			},
 		}
 
@@ -247,7 +255,6 @@ func TestOverriddenValues(t *testing.T) {
 		NATLeaseM:               90,
 		NATRenewalM:             15,
 		NATTimeoutS:             15,
-		RestartOnWakeup:         false,
 		AutoUpgradeIntervalH:    24,
 		KeepTemporariesH:        48,
 		CacheIgnoredFiles:       true,
@@ -447,7 +454,7 @@ func TestVersioningConfig(t *testing.T) {
 }
 
 func TestIssue1262(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skipf("path gets converted to absolute as part of the filesystem initialization on linux")
 	}
 
@@ -457,7 +464,7 @@ func TestIssue1262(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual := cfg.Folders()["test"].Filesystem().URI()
+	actual := cfg.Folders()["test"].Filesystem(nil).URI()
 	expected := `e:\`
 
 	if actual != expected {
@@ -494,7 +501,7 @@ func TestFolderPath(t *testing.T) {
 		Path: "~/tmp",
 	}
 
-	realPath := folder.Filesystem().URI()
+	realPath := folder.Filesystem(nil).URI()
 	if !filepath.IsAbs(realPath) {
 		t.Error(realPath, "should be absolute")
 	}
@@ -504,13 +511,10 @@ func TestFolderPath(t *testing.T) {
 }
 
 func TestFolderCheckPath(t *testing.T) {
-	n, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	n := t.TempDir()
 	testFs := fs.NewFilesystem(fs.FilesystemTypeBasic, n)
 
-	err = os.MkdirAll(filepath.Join(n, "dir", ".stfolder"), os.FileMode(0777))
+	err := os.MkdirAll(filepath.Join(n, "dir", ".stfolder"), os.FileMode(0777))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +547,7 @@ func TestFolderCheckPath(t *testing.T) {
 			path: "link",
 			err:  nil,
 		})
-	} else if runtime.GOOS != "windows" {
+	} else if !build.IsWindows {
 		t.Log("running without symlink check")
 		t.Fatal(err)
 	}
@@ -598,15 +602,11 @@ func TestNewSaveLoad(t *testing.T) {
 }
 
 func TestWindowsLineEndings(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skip("Windows specific")
 	}
 
-	dir, err := os.MkdirTemp("", "syncthing-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	path := filepath.Join(dir, "config.xml")
 	os.Remove(path)
@@ -1426,5 +1426,45 @@ func TestReceiveEncryptedFolderFixed(t *testing.T) {
 	}
 	if !f.IgnorePerms {
 		t.Error("IgnorePerms should be true")
+	}
+}
+
+func TestXattrFilter(t *testing.T) {
+	cases := []struct {
+		in     []string
+		filter []XattrFilterEntry
+		out    []string
+	}{
+		{in: nil, filter: nil, out: nil},
+		{in: []string{"foo", "bar", "baz"}, filter: nil, out: []string{"foo", "bar", "baz"}},
+		{
+			in:     []string{"foo", "bar", "baz"},
+			filter: []XattrFilterEntry{{Match: "b*", Permit: true}},
+			out:    []string{"bar", "baz"},
+		},
+		{
+			in:     []string{"foo", "bar", "baz"},
+			filter: []XattrFilterEntry{{Match: "b*", Permit: false}, {Match: "*", Permit: true}},
+			out:    []string{"foo"},
+		},
+		{
+			in:     []string{"foo", "bar", "baz"},
+			filter: []XattrFilterEntry{{Match: "yoink", Permit: true}},
+			out:    []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		f := XattrFilter{Entries: tc.filter}
+		var out []string
+		for _, s := range tc.in {
+			if f.Permit(s) {
+				out = append(out, s)
+			}
+		}
+
+		if fmt.Sprint(out) != fmt.Sprint(tc.out) {
+			t.Errorf("Filter.Apply(%v, %v) == %v, expected %v", tc.in, tc.filter, out, tc.out)
+		}
 	}
 }

@@ -133,13 +133,13 @@ var (
 	update0to3Folder             = "UpdateSchema0to3"
 	invalid                      = "invalid"
 	slashPrefixed                = "/notgood"
-	haveUpdate0to3               map[protocol.DeviceID]fileList
+	haveUpdate0to3               map[protocol.DeviceID][]protocol.FileInfo
 )
 
 func init() {
 	remoteDevice0, _ = protocol.DeviceIDFromString("AIR6LPZ-7K4PTTV-UXQSMUU-CPQ5YWH-OEDFIIQ-JUG777G-2YQXXR5-YD6AWQR")
 	remoteDevice1, _ = protocol.DeviceIDFromString("I6KAH76-66SLLLB-5PFXSOA-UFJCDZC-YAOMLEK-CP2GB32-BV5RQST-3PSROAU")
-	haveUpdate0to3 = map[protocol.DeviceID]fileList{
+	haveUpdate0to3 = map[protocol.DeviceID][]protocol.FileInfo{
 		protocol.LocalDeviceID: {
 			protocol.FileInfo{Name: "a", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(1)},
 			protocol.FileInfo{Name: slashPrefixed, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(1)},
@@ -212,7 +212,7 @@ func TestUpdate0to3(t *testing.T) {
 			t.Error("Unexpected additional file via sequence", f.FileName())
 			return true
 		}
-		if e := haveUpdate0to3[protocol.LocalDeviceID][0]; f.IsEquivalentOptional(e, 0, true, true, 0) {
+		if e := haveUpdate0to3[protocol.LocalDeviceID][0]; f.IsEquivalentOptional(e, protocol.FileInfoComparison{IgnorePerms: true, IgnoreBlocks: true}) {
 			found = true
 		} else {
 			t.Errorf("Wrong file via sequence, got %v, expected %v", f, e)
@@ -281,7 +281,7 @@ func TestUpdate0to3(t *testing.T) {
 		}
 		f := fi.(protocol.FileInfo)
 		delete(need, f.Name)
-		if !f.IsEquivalentOptional(e, 0, true, true, 0) {
+		if !f.IsEquivalentOptional(e, protocol.FileInfoComparison{IgnorePerms: true, IgnoreBlocks: true}) {
 			t.Errorf("Wrong needed file, got %v, expected %v", f, e)
 		}
 	}
@@ -754,7 +754,7 @@ func TestUpdateTo14(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Initally add the correct file the usual way, all good here.
+	// Initially add the correct file the usual way, all good here.
 	if err := db.updateLocalFiles(folder, []protocol.FileInfo{file}, meta); err != nil {
 		t.Fatal(err)
 	}

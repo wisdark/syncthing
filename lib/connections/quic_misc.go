@@ -13,14 +13,17 @@ import (
 	"crypto/tls"
 	"net"
 	"net/url"
+	"time"
 
 	"github.com/lucas-clemente/quic-go"
+	"github.com/syncthing/syncthing/lib/osutil"
 )
 
 var (
 	quicConfig = &quic.Config{
 		ConnectionIDLength: 4,
-		KeepAlive:          true,
+		MaxIdleTimeout:     30 * time.Second,
+		KeepAlivePeriod:    15 * time.Second,
 	}
 )
 
@@ -36,7 +39,7 @@ func quicNetwork(uri *url.URL) string {
 }
 
 type quicTlsConn struct {
-	quic.Session
+	quic.Connection
 	quic.Stream
 	// If we created this connection, we should be the ones closing it.
 	createdConn net.PacketConn
@@ -44,7 +47,7 @@ type quicTlsConn struct {
 
 func (q *quicTlsConn) Close() error {
 	sterr := q.Stream.Close()
-	seerr := q.Session.CloseWithError(0, "closing")
+	seerr := q.Connection.CloseWithError(0, "closing")
 	var pcerr error
 	if q.createdConn != nil {
 		pcerr = q.createdConn.Close()
@@ -59,13 +62,11 @@ func (q *quicTlsConn) Close() error {
 }
 
 func (q *quicTlsConn) ConnectionState() tls.ConnectionState {
-	return q.Session.ConnectionState().TLS.ConnectionState
+	return q.Connection.ConnectionState().TLS.ConnectionState
 }
 
 func packetConnUnspecified(conn interface{}) bool {
-	// Since QUIC connections are wrapped, we can't do a simple typecheck
-	// on *net.UDPAddr here.
 	addr := conn.(net.PacketConn).LocalAddr()
-	host, _, err := net.SplitHostPort(addr.String())
-	return err == nil && net.ParseIP(host).IsUnspecified()
+	ip, err := osutil.IPFromAddr(addr)
+	return err == nil && ip.IsUnspecified()
 }
