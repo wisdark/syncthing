@@ -24,7 +24,6 @@
   <link href="assets/css/tree.css" rel="stylesheet"/>
   <link href="assets/css/overrides.css" rel="stylesheet"/>
   <link href="assets/css/theme.css" rel="stylesheet"/>
-  <link href="assets/css/customicons.css" rel="stylesheet"/>
 </head>
 
 <body>
@@ -720,9 +719,7 @@
                     </tr>
                     <tr>
                       <th><span class="fas fa-fw fa-tag"></span>&nbsp;<span translate>Version</span></th>
-                      <td class="text-right">
-                        <span tooltip data-original-title="{{versionString()}}">{{versionString()}}</span>
-                      </td>
+                      <td class="text-right no-overflow-ellipse">{{versionString()}}</td>
                     </tr>
                   </tbody>
                 </table>
@@ -751,12 +748,8 @@
                       <span ng-switch-when="disconnected-inactive"><span class="hidden-xs" translate>Disconnected (Inactive)</span><span class="visible-xs" aria-label="{{'Disconnected (Inactive)' | translate}}"><i class="fas fa-fw fa-power-off"></i></span></span>
                       <span ng-switch-when="unused-disconnected"><span class="hidden-xs" translate>Disconnected (Unused)</span><span class="visible-xs" aria-label="{{'Disconnected (Unused)' | translate}}"><i class="fas fa-fw fa-unlink"></i></span></span>
                     </span>
-                    <span ng-switch="rdConnType(deviceCfg.deviceID)" class="remote-devices-panel">
-                      <span ng-switch-when="tcplan" class="reception reception-4 reception-theme"></span>
-                      <span ng-switch-when="tcpwan" class="reception reception-3 reception-theme"></span>
-                      <span ng-switch-when="quic" class="reception reception-2 reception-theme"></span>
-                      <span ng-switch-when="relay" class="reception reception-1 reception-theme"></span>
-                      <span ng-switch-when="disconnected" class="reception reception-0 reception-theme"></span>
+                    <span class="remote-devices-panel">
+                      <span ng-class="rdConnTypeIcon(rdConnType(deviceCfg.deviceID))" class="reception reception-theme"></span>
                     </span>
                   </span>
                   <div class="panel-title-text">{{deviceName(deviceCfg)}}</div>
@@ -849,7 +842,7 @@
                       </tr>
                       <tr ng-if="connections[deviceCfg.deviceID].connected">
                         <th><span class="reception reception-4 reception-theme"></span>&nbsp;<span translate>Connection Type</span></th>
-                        <td ng-if="connections[deviceCfg.deviceID].connected" class="text-right">
+                        <td class="text-right">
                           <span tooltip data-original-title="{{rdConnDetails(rdConnType(deviceCfg.deviceID))}}">
                             {{rdConnTypeString(rdConnType(deviceCfg.deviceID))}}
                           </span>
