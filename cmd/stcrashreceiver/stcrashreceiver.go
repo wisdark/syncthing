@@ -12,11 +12,16 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 )
 
 type crashReceiver struct {
 	store  *diskStore
 	sentry *sentryService
+	ignore *ignorePatterns
+
+	ignoredMut sync.RWMutex
+	ignored    map[string]struct{}
 }
 
 func (r *crashReceiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -64,6 +69,12 @@ func (r *crashReceiver) serveGet(reportID string, w http.ResponseWriter, _ *http
 // serveHead responds to HEAD requests by checking if the named report
 // already exists in the system.
 func (r *crashReceiver) serveHead(reportID string, w http.ResponseWriter, _ *http.Request) {
+	r.ignoredMut.RLock()
+	_, ignored := r.ignored[reportID]
+	r.ignoredMut.RUnlock()
+	if ignored {
+		return // found
+	}
 	if !r.store.Exists(reportID) {
 		http.Error(w, "Not found", http.StatusNotFound)
 	}
@@ -71,6 +82,20 @@ func (r *crashReceiver) serveHead(reportID string, w http.ResponseWriter, _ *htt
 
 // servePut accepts and stores the given report.
 func (r *crashReceiver) servePut(reportID string, w http.ResponseWriter, req *http.Request) {
+	result := "receive_failure"
+	defer func() {
+		metricCrashReportsTotal.WithLabelValues(result).Inc()
+	}()
+
+	r.ignoredMut.RLock()
+	_, ignored := r.ignored[reportID]
+	r.ignoredMut.RUnlock()
+	if ignored {
+		result = "ignored_cached"
+		io.Copy(io.Discard, req.Body)
+		return // found
+	}
+
 	// Read at most maxRequestSize of report data.
 	log.Println("Receiving report", reportID)
 	lr := io.LimitReader(req.Body, maxRequestSize)
@@ -81,13 +106,28 @@ func (r *crashReceiver) servePut(reportID string, w http.ResponseWriter, req *ht
 		return
 	}
 
+	if r.ignore.match(bs) {
+		r.ignoredMut.Lock()
+		if r.ignored == nil {
+			r.ignored = make(map[string]struct{})
+		}
+		r.ignored[reportID] = struct{}{}
+		r.ignoredMut.Unlock()
+		result = "ignored"
+		return
+	}
+
+	result = "success"
+
 	// Store the report
 	if !r.store.Put(reportID, bs) {
 		log.Println("Failed to store report (queue full):", reportID)
+		result = "queue_failure"
 	}
 
 	// Send the report to Sentry
-	if !r.sentry.Send(reportID, bs) {
+	if !r.sentry.Send(reportID, userIDFor(req), bs) {
 		log.Println("Failed to send report to sentry (queue full):", reportID)
+		result = "sentry_failure"
 	}
 }

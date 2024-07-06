@@ -133,6 +133,10 @@ func (f FileInfoTruncated) InodeChangeTime() time.Time {
 	return time.Unix(0, f.InodeChangeNs)
 }
 
+func (f FileInfoTruncated) FileBlocksHash() []byte {
+	return f.BlocksHash
+}
+
 func (f FileInfoTruncated) ConvertToIgnoredFileInfo() protocol.FileInfo {
 	file := f.copyToFileInfo()
 	file.SetIgnored()
@@ -384,7 +388,7 @@ func (vl *VersionList) findGlobal() int {
 	return 0
 }
 
-// findDevices returns whether the device is in InvalidVersions or Versions and
+// findDevice returns whether the device is in InvalidVersions or Versions and
 // in InvalidDevices or Devices (true for invalid), the positions in the version
 // and device slices and whether it has been found at all.
 func (vl *VersionList) findDevice(device []byte) (bool, int, int, bool) {

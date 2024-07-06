@@ -7,9 +7,12 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +23,6 @@ import (
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/util"
 )
 
 var (
@@ -90,30 +92,58 @@ func (f *FolderConfiguration) CreateMarker() error {
 		return nil
 	}
 
-	permBits := fs.FileMode(0777)
-	if build.IsWindows {
-		// Windows has no umask so we must chose a safer set of bits to
-		// begin with.
-		permBits = 0700
-	}
-	fs := f.Filesystem(nil)
-	err := fs.Mkdir(DefaultMarkerName, permBits)
+	ffs := f.Filesystem(nil)
+
+	// Create the marker as a directory
+	err := ffs.Mkdir(DefaultMarkerName, 0o755)
 	if err != nil {
 		return err
 	}
-	if dir, err := fs.Open("."); err != nil {
+
+	// Create a file inside it, reducing the risk of the marker directory
+	// being removed by automated cleanup tools.
+	markerFile := filepath.Join(DefaultMarkerName, f.markerFilename())
+	if err := fs.WriteFile(ffs, markerFile, f.markerContents(), 0o644); err != nil {
+		return err
+	}
+
+	// Sync & hide the containing directory
+	if dir, err := ffs.Open("."); err != nil {
 		l.Debugln("folder marker: open . failed:", err)
 	} else if err := dir.Sync(); err != nil {
 		l.Debugln("folder marker: fsync . failed:", err)
 	}
-	fs.Hide(DefaultMarkerName)
+	ffs.Hide(DefaultMarkerName)
 
 	return nil
 }
 
+func (f *FolderConfiguration) RemoveMarker() error {
+	ffs := f.Filesystem(nil)
+	_ = ffs.Remove(filepath.Join(DefaultMarkerName, f.markerFilename()))
+	return ffs.Remove(DefaultMarkerName)
+}
+
+func (f *FolderConfiguration) markerFilename() string {
+	h := sha256.Sum256([]byte(f.ID))
+	return fmt.Sprintf("syncthing-folder-%x.txt", h[:3])
+}
+
+func (f *FolderConfiguration) markerContents() []byte {
+	var buf bytes.Buffer
+	buf.WriteString("# This directory is a Syncthing folder marker.\n# Do not delete.\n\n")
+	fmt.Fprintf(&buf, "folderID: %s\n", f.ID)
+	fmt.Fprintf(&buf, "created: %s\n", time.Now().Format(time.RFC3339))
+	return buf.Bytes()
+}
+
 // CheckPath returns nil if the folder root exists and contains the marker file
 func (f *FolderConfiguration) CheckPath() error {
-	fi, err := f.Filesystem(nil).Stat(".")
+	return f.checkFilesystemPath(f.Filesystem(nil), ".")
+}
+
+func (f *FolderConfiguration) checkFilesystemPath(ffs fs.Filesystem, path string) error {
+	fi, err := ffs.Stat(path)
 	if err != nil {
 		if !fs.IsNotExist(err) {
 			return err
@@ -131,7 +161,7 @@ func (f *FolderConfiguration) CheckPath() error {
 		return ErrPathNotDirectory
 	}
 
-	_, err = f.Filesystem(nil).Stat(f.MarkerName)
+	_, err = ffs.Stat(filepath.Join(path, f.MarkerName))
 	if err != nil {
 		if !fs.IsNotExist(err) {
 			return err
@@ -145,11 +175,11 @@ func (f *FolderConfiguration) CheckPath() error {
 func (f *FolderConfiguration) CreateRoot() (err error) {
 	// Directory permission bits. Will be filtered down to something
 	// sane by umask on Unixes.
-	permBits := fs.FileMode(0777)
+	permBits := fs.FileMode(0o777)
 	if build.IsWindows {
 		// Windows has no umask so we must chose a safer set of bits to
 		// begin with.
-		permBits = 0700
+		permBits = 0o700
 	}
 
 	filesystem := f.Filesystem(nil)
@@ -176,14 +206,16 @@ func (f *FolderConfiguration) DeviceIDs() []protocol.DeviceID {
 	return deviceIDs
 }
 
-func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]bool) {
+func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) {
 	// Ensure that
 	// - any loose devices are not present in the wrong places
 	// - there are no duplicate devices
 	// - we are part of the devices
+	// - folder is not shared in trusted mode with an untrusted device
 	f.Devices = ensureExistingDevices(f.Devices, existingDevices)
 	f.Devices = ensureNoDuplicateFolderDevices(f.Devices)
 	f.Devices = ensureDevicePresent(f.Devices, myID)
+	f.Devices = ensureNoUntrustedTrustingSharing(f, f.Devices, existingDevices)
 
 	sort.Slice(f.Devices, func(a, b int) bool {
 		return f.Devices[a].DeviceID.Compare(f.Devices[b].DeviceID) == -1
@@ -198,6 +230,8 @@ func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices ma
 	if f.FSWatcherDelayS <= 0 {
 		f.FSWatcherEnabled = false
 		f.FSWatcherDelayS = 10
+	} else if f.FSWatcherDelayS < 0.01 {
+		f.FSWatcherDelayS = 0.01
 	}
 
 	if f.Versioning.CleanupIntervalS > MaxRescanIntervalS {
@@ -235,7 +269,7 @@ func (f FolderConfiguration) RequiresRestartOnly() FolderConfiguration {
 	// copier, yet should not cause a restart.
 
 	blank := FolderConfiguration{}
-	util.CopyMatchingTag(&blank, &copy, "restart", func(v string) bool {
+	copyMatchingTag(&blank, &copy, "restart", func(v string) bool {
 		if len(v) > 0 && v != "false" {
 			panic(fmt.Sprintf(`unexpected tag value: %s. expected untagged or "false"`, v))
 		}

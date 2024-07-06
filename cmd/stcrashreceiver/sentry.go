@@ -18,6 +18,7 @@ import (
 
 	raven "github.com/getsentry/raven-go"
 	"github.com/maruel/panicparse/v2/stack"
+	"github.com/syncthing/syncthing/lib/build"
 )
 
 const reportServer = "https://crash.syncthing.net/report/"
@@ -40,6 +41,7 @@ type sentryService struct {
 
 type sentryRequest struct {
 	reportID string
+	userID   string
 	data     []byte
 }
 
@@ -52,7 +54,7 @@ func (s *sentryService) Serve(ctx context.Context) {
 				log.Println("Failed to parse crash report:", err)
 				continue
 			}
-			if err := sendReport(s.dsn, pkt, req.reportID); err != nil {
+			if err := sendReport(s.dsn, pkt, req.userID); err != nil {
 				log.Println("Failed to send crash report:", err)
 			}
 
@@ -62,9 +64,9 @@ func (s *sentryService) Serve(ctx context.Context) {
 	}
 }
 
-func (s *sentryService) Send(reportID string, data []byte) bool {
+func (s *sentryService) Send(reportID, userID string, data []byte) bool {
 	select {
-	case s.inbox <- sentryRequest{reportID, data}:
+	case s.inbox <- sentryRequest{reportID, userID, data}:
 		return true
 	default:
 		return false
@@ -104,7 +106,7 @@ func parseCrashReport(path string, report []byte) (*raven.Packet, error) {
 		return nil, errors.New("no first line")
 	}
 
-	version, err := parseVersion(string(parts[0]))
+	version, err := build.ParseVersion(string(parts[0]))
 	if err != nil {
 		return nil, err
 	}
@@ -142,12 +144,12 @@ func parseCrashReport(path string, report []byte) (*raven.Packet, error) {
 	}
 
 	// Lock the source code loader to the version we are processing here.
-	if version.commit != "" {
+	if version.Commit != "" {
 		// We have a commit hash, so we know exactly which source to use
-		loader.LockWithVersion(version.commit)
-	} else if strings.HasPrefix(version.tag, "v") {
+		loader.LockWithVersion(version.Commit)
+	} else if strings.HasPrefix(version.Tag, "v") {
 		// Lets hope the tag is close enough
-		loader.LockWithVersion(version.tag)
+		loader.LockWithVersion(version.Tag)
 	} else {
 		// Last resort
 		loader.LockWithVersion("main")
@@ -214,89 +216,26 @@ func crashReportFingerprint(message string) []string {
 	return []string{"{{ default }}", message}
 }
 
-// syncthing v1.1.4-rc.1+30-g6aaae618-dirty-crashrep "Erbium Earthworm" (go1.12.5 darwin-amd64) jb@kvin.kastelo.net 2019-05-23 16:08:14 UTC [foo, bar]
-var longVersionRE = regexp.MustCompile(`syncthing\s+(v[^\s]+)\s+"([^"]+)"\s\(([^\s]+)\s+([^-]+)-([^)]+)\)\s+([^\s]+)[^\[]*(?:\[(.+)\])?$`)
-
-type version struct {
-	version  string   // "v1.1.4-rc.1+30-g6aaae618-dirty-crashrep"
-	tag      string   // "v1.1.4-rc.1"
-	commit   string   // "6aaae618", blank when absent
-	codename string   // "Erbium Earthworm"
-	runtime  string   // "go1.12.5"
-	goos     string   // "darwin"
-	goarch   string   // "amd64"
-	builder  string   // "jb@kvin.kastelo.net"
-	extra    []string // "foo", "bar"
-}
-
-func (v version) environment() string {
-	if v.commit != "" {
-		return "Development"
-	}
-	if strings.Contains(v.tag, "-rc.") {
-		return "Candidate"
-	}
-	if strings.Contains(v.tag, "-") {
-		return "Beta"
-	}
-	return "Stable"
-}
-
-func parseVersion(line string) (version, error) {
-	m := longVersionRE.FindStringSubmatch(line)
-	if len(m) == 0 {
-		return version{}, errors.New("unintelligeble version string")
-	}
-
-	v := version{
-		version:  m[1],
-		codename: m[2],
-		runtime:  m[3],
-		goos:     m[4],
-		goarch:   m[5],
-		builder:  m[6],
-	}
-
-	parts := strings.Split(v.version, "+")
-	v.tag = parts[0]
-	if len(parts) > 1 {
-		fields := strings.Split(parts[1], "-")
-		if len(fields) >= 2 && strings.HasPrefix(fields[1], "g") {
-			v.commit = fields[1][1:]
-		}
-	}
-
-	if len(m) >= 8 && m[7] != "" {
-		tags := strings.Split(m[7], ",")
-		for i := range tags {
-			tags[i] = strings.TrimSpace(tags[i])
-		}
-		v.extra = tags
-	}
-
-	return v, nil
-}
-
-func packet(version version, reportType string) *raven.Packet {
+func packet(version build.VersionParts, reportType string) *raven.Packet {
 	pkt := &raven.Packet{
 		Platform:    "go",
-		Release:     version.tag,
-		Environment: version.environment(),
+		Release:     version.Tag,
+		Environment: version.Environment(),
 		Tags: raven.Tags{
-			raven.Tag{Key: "version", Value: version.version},
-			raven.Tag{Key: "tag", Value: version.tag},
-			raven.Tag{Key: "codename", Value: version.codename},
-			raven.Tag{Key: "runtime", Value: version.runtime},
-			raven.Tag{Key: "goos", Value: version.goos},
-			raven.Tag{Key: "goarch", Value: version.goarch},
-			raven.Tag{Key: "builder", Value: version.builder},
+			raven.Tag{Key: "version", Value: version.Version},
+			raven.Tag{Key: "tag", Value: version.Tag},
+			raven.Tag{Key: "codename", Value: version.Codename},
+			raven.Tag{Key: "runtime", Value: version.Runtime},
+			raven.Tag{Key: "goos", Value: version.GOOS},
+			raven.Tag{Key: "goarch", Value: version.GOARCH},
+			raven.Tag{Key: "builder", Value: version.Builder},
 			raven.Tag{Key: "report_type", Value: reportType},
 		},
 	}
-	if version.commit != "" {
-		pkt.Tags = append(pkt.Tags, raven.Tag{Key: "commit", Value: version.commit})
+	if version.Commit != "" {
+		pkt.Tags = append(pkt.Tags, raven.Tag{Key: "commit", Value: version.Commit})
 	}
-	for _, tag := range version.extra {
+	for _, tag := range version.Extra {
 		pkt.Tags = append(pkt.Tags, raven.Tag{Key: tag, Value: "1"})
 	}
 	return pkt
