@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
-	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/thejerf/suture/v4"
 	"github.com/willabides/kongplete"
 
@@ -38,6 +37,7 @@ import (
 	"github.com/syncthing/syncthing/cmd/syncthing/cmdutil"
 	"github.com/syncthing/syncthing/cmd/syncthing/decrypt"
 	"github.com/syncthing/syncthing/cmd/syncthing/generate"
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
@@ -91,11 +91,6 @@ above.
 
  STLOCKTHRESHOLD   Used for debugging internal deadlocks; sets debug
                    sensitivity.  Use only under direction of a developer.
-
- STHASHING         Select the SHA256 hashing package to use. Possible values
-                   are "standard" for the Go standard library implementation,
-                   "minio" for the github.com/minio/sha256-simd implementation,
-                   and blank (the default) for auto detection.
 
  STVERSIONEXTRA    Add extra information to the version string in logs and the
                    version line in the GUI. Can be set to the name of a wrapper

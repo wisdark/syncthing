@@ -9,6 +9,7 @@ package scanner
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -20,14 +21,14 @@ import (
 	"testing"
 
 	"github.com/d4l3k/messagediff"
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/sha256"
-	"golang.org/x/text/unicode/norm"
 )
 
 type testfile struct {
